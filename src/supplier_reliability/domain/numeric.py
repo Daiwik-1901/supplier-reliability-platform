@@ -12,6 +12,8 @@ def _to_decimal(x: Decimal | int | str | float) -> Decimal:
 
 
 def to_money(x: Decimal | int | str) -> Decimal:
+    if isinstance(x, float):
+        raise TypeError("floats never touch money: pass Decimal, int or str")
     return _to_decimal(x).quantize(_TWO_DP, rounding=ROUND_HALF_UP)
 
 
@@ -21,6 +23,8 @@ def round_score(x: float | Decimal) -> Decimal:
 
 def safe_ratio(n: Decimal | int | str, d: Decimal | int | str) -> Decimal | None:
     """n / d, or None when d == 0 (missing is not zero)."""
+    if isinstance(n, float) or isinstance(d, float):
+        raise TypeError("floats never touch money: pass Decimal, int or str")
     denominator = _to_decimal(d)
     if denominator == 0:
         return None

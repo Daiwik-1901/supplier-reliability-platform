@@ -202,16 +202,16 @@ def test_timestamps_roundtrip_as_utc_aware(factory):
 
 
 def test_naive_datetime_rejected(factory):
-    with pytest.raises((StatementError, ValueError)), session_scope(factory) as s:
+    with pytest.raises(StatementError, match="naive datetime"), session_scope(factory) as s:
         s.add(supplier(created_at=datetime(2025, 1, 1)))
 
 
 def test_invalid_enum_rejected(factory):
     # ORM layer refuses unknown members ...
-    with pytest.raises(StatementError), session_scope(factory) as s:
+    with pytest.raises(StatementError, match="BOGUS"), session_scope(factory) as s:
         s.add(supplier(supplier_status="BOGUS"))
     # ... and the database CHECK refuses them even when the ORM is bypassed.
-    with pytest.raises(IntegrityError), session_scope(factory) as s:
+    with pytest.raises(IntegrityError, match="supplierstatus"), session_scope(factory) as s:
         s.execute(
             sa.text(
                 "INSERT INTO suppliers VALUES ('SUP-000002','n','ELECTRONICS','US','NA',"
@@ -301,3 +301,76 @@ def test_session_scope_rolls_back_on_error(factory):
         raise RuntimeError
     with session_scope(factory) as s:
         assert s.get(Supplier, "SUP-000001") is None
+
+
+def a_site(**kw) -> Site:
+    base = dict(
+        site_id="SITE-SUP-000001-01",
+        supplier_id="SUP-000001",
+        site_name="s",
+        site_type="FACTORY",
+        country="US",
+        region="NA",
+        site_status="ACTIVE",
+        effective_from=date(2025, 1, 1),
+        created_at=T0,
+    )
+    base.update(kw)
+    return Site(**base)
+
+
+def test_requirement_scope_site_consistency(factory):
+    with session_scope(factory) as s:
+        add_in_order(s, supplier(), a_site(), contract())
+    commit_fails(factory, requirement(scope="SITE", site_id=None), match="scope_site")
+    commit_fails(
+        factory, requirement(scope="SUPPLIER", site_id="SITE-SUP-000001-01"), match="scope_site"
+    )
+    with session_scope(factory) as s:
+        add_in_order(
+            s,
+            requirement(requirement_id="R-A", scope="SITE", site_id="SITE-SUP-000001-01"),
+            requirement(requirement_id="R-B", scope="SUPPLIER", site_id=None),
+        )
+
+
+def test_certification_same_number_superseding_row_allowed(factory):
+    with session_scope(factory) as s:
+        add_in_order(
+            s,
+            supplier(),
+            cert("CERT-1"),
+            cert(
+                "CERT-2",
+                compliance_status="NONCOMPLIANT",
+                supersedes_certification_id="CERT-1",
+                recorded_at=T0 + timedelta(days=30),
+            ),
+        )
+    with session_scope(factory) as s:
+        assert s.scalar(sa.select(sa.func.count()).select_from(SupplierCertification)) == 2
+
+
+def test_certification_exact_duplicate_rejected(factory):
+    with session_scope(factory) as s:
+        add_in_order(s, supplier(), cert("CERT-1"))
+    commit_fails(factory, cert("CERT-2"), match="UNIQUE")
+
+
+def test_composite_unique_name_contains_all_columns():
+    names = {c.name for c in Base.metadata.tables["supplier_certifications"].constraints}
+    assert "uq_supplier_certifications_supplier_id_certificate_number_recorded_at" in names
+
+
+def test_unit_server_default(factory):
+    with session_scope(factory) as s:
+        add_in_order(s, supplier(), contract())
+        s.execute(
+            sa.text(
+                "INSERT INTO capacity_declarations (capacity_declaration_id, supplier_id,"
+                " period_start, period_end, available_capacity, committed_capacity,"
+                " verification_status, source, recorded_at) VALUES ('C9','SUP-000001',"
+                "'2025-01-01','2025-01-31',1,0,'VERIFIED','x','2025-01-01 00:00:00')"
+            )
+        )
+        assert s.scalar(sa.text("SELECT unit FROM capacity_declarations")) == "units/month"

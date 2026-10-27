@@ -6,9 +6,11 @@ from enum import StrEnum
 import sqlalchemy as sa
 from sqlalchemy.orm import DeclarativeBase
 
+from supplier_reliability.domain.numeric import ensure_utc
+
 NAMING_CONVENTION = {
-    "ix": "ix_%(column_0_label)s",
-    "uq": "uq_%(table_name)s_%(column_0_name)s",
+    "ix": "ix_%(table_name)s_%(column_0_N_name)s",
+    "uq": "uq_%(table_name)s_%(column_0_N_name)s",
     "ck": "ck_%(table_name)s_%(constraint_name)s",
     "fk": "fk_%(table_name)s_%(column_0_name)s_%(referred_table_name)s",
     "pk": "pk_%(table_name)s",
@@ -28,9 +30,7 @@ class UTCDateTime(sa.TypeDecorator):
     def process_bind_param(self, value: datetime | None, dialect) -> datetime | None:
         if value is None:
             return None
-        if value.tzinfo is None or value.utcoffset() is None:
-            raise ValueError("naive datetime rejected: timezone-aware datetime required")
-        return value.astimezone(UTC)
+        return ensure_utc(value)
 
     def process_result_value(self, value: datetime | None, dialect) -> datetime | None:
         if value is None:

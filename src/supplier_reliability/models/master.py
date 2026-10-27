@@ -81,7 +81,9 @@ class Contract(Base):
     payment_terms: Mapped[str] = mapped_column(sa.String(64))
     delivery_terms: Mapped[str] = mapped_column(sa.String(64))
     contracted_capacity: Mapped[Decimal | None] = mapped_column(CAPACITY)
-    capacity_unit: Mapped[str] = mapped_column(sa.String(32), default="units/month")
+    capacity_unit: Mapped[str] = mapped_column(
+        sa.String(32), default="units/month", server_default="units/month"
+    )
     created_at: Mapped[datetime] = mapped_column(UTCDateTime)
 
 
@@ -99,6 +101,10 @@ class ContractPrice(Base):
 class ComplianceRequirement(Base):
     __tablename__ = "compliance_requirements"
     __table_args__ = (
+        sa.CheckConstraint(
+            "(scope = 'SITE' AND site_id IS NOT NULL) OR (scope = 'SUPPLIER' AND site_id IS NULL)",
+            name="scope_site",
+        ),
         sa.CheckConstraint(
             "effective_to IS NULL OR effective_to >= effective_from", name="effective_dates"
         ),
@@ -120,7 +126,7 @@ class SupplierCertification(Base):
 
     __tablename__ = "supplier_certifications"
     __table_args__ = (
-        sa.UniqueConstraint("supplier_id", "certificate_number"),
+        sa.UniqueConstraint("supplier_id", "certificate_number", "recorded_at"),
         sa.CheckConstraint("valid_to >= valid_from", name="valid_dates"),
     )
 
@@ -157,7 +163,9 @@ class CapacityDeclaration(Base):
     site_id: Mapped[str | None] = mapped_column(sa.ForeignKey("sites.site_id"))
     period_start: Mapped[date] = mapped_column(sa.Date)
     period_end: Mapped[date] = mapped_column(sa.Date)
-    unit: Mapped[str] = mapped_column(sa.String(32), default="units/month")
+    unit: Mapped[str] = mapped_column(
+        sa.String(32), default="units/month", server_default="units/month"
+    )
     available_capacity: Mapped[Decimal] = mapped_column(CAPACITY)
     committed_capacity: Mapped[Decimal] = mapped_column(CAPACITY)
     verification_status: Mapped[CapacityVerification] = mapped_column(

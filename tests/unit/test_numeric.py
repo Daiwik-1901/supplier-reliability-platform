@@ -6,7 +6,9 @@ import pytest
 from supplier_reliability.domain.enums import (
     DELIVERY_EVENT_TRANSITIONS,
     DeliveryEventType,
+    effective_sequence,
     is_valid_transition,
+    validate_sequence,
 )
 from supplier_reliability.domain.numeric import ensure_utc, round_score, safe_ratio, to_money
 
@@ -67,7 +69,35 @@ def test_transition_table_matches_d4():
         (E.BOOKED, E.CORRECTION, True),
         (E.RECEIVED, E.CORRECTION, True),
         (None, E.CORRECTION, False),
+        (E.CORRECTION, E.CORRECTION, True),
+        (E.CORRECTION, E.ARRIVED, False),
+        (E.CORRECTION, E.BOOKED, False),
     ],
 )
 def test_is_valid_transition(prev, nxt, ok):
     assert is_valid_transition(prev, nxt) is ok
+
+
+def test_to_money_rejects_float():
+    with pytest.raises(TypeError):
+        to_money(1.5)
+
+
+def test_safe_ratio_rejects_float():
+    with pytest.raises(TypeError):
+        safe_ratio(1.0, 2)
+
+
+def test_effective_sequence_drops_corrections():
+    assert effective_sequence([E.BOOKED, E.CORRECTION, E.DISPATCHED]) == [E.BOOKED, E.DISPATCHED]
+
+
+def test_validate_sequence_with_midstream_correction():
+    seq = [E.BOOKED, E.DISPATCHED, E.CORRECTION, E.IN_TRANSIT, E.DELAYED, E.DELAYED, E.ARRIVED]
+    assert validate_sequence(seq + [E.CORRECTION, E.RECEIVED, E.CORRECTION])
+
+
+def test_validate_sequence_rejects_out_of_order_and_leading_correction():
+    assert not validate_sequence([E.BOOKED, E.ARRIVED, E.DISPATCHED])
+    assert not validate_sequence([E.CORRECTION, E.BOOKED])
+    assert not validate_sequence([E.DISPATCHED])

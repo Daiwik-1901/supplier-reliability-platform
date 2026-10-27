@@ -1,5 +1,6 @@
 """Domain enumerations. Every member's value equals its name (portable CHECK constraints)."""
 
+from collections.abc import Iterable
 from enum import StrEnum
 
 
@@ -124,10 +125,37 @@ DELIVERY_EVENT_TRANSITIONS: dict[DeliveryEventType | None, frozenset[DeliveryEve
 
 
 def is_valid_transition(prev: DeliveryEventType | None, nxt: DeliveryEventType) -> bool:
-    """Whether `nxt` may follow `prev` (the last non-CORRECTION event, None for a new shipment)."""
+    """Whether `nxt` may follow `prev`. Never raises.
+
+    `prev` is the previous event as recorded, or None for a new shipment. CORRECTION may follow
+    any event, but not start a shipment. When `prev` is CORRECTION the effective state is unknown
+    to this function, so only another CORRECTION is accepted; callers that need the effective
+    state must skip CORRECTION events first (see `effective_sequence`).
+    """
     if nxt is DeliveryEventType.CORRECTION:
         return prev is not None
+    if prev is DeliveryEventType.CORRECTION:
+        return False
     return nxt in DELIVERY_EVENT_TRANSITIONS[prev]
+
+
+def effective_sequence(events: Iterable[DeliveryEventType]) -> list[DeliveryEventType]:
+    """The events with CORRECTION dropped (corrections do not advance state)."""
+    return [e for e in events if e is not DeliveryEventType.CORRECTION]
+
+
+def validate_sequence(events: Iterable[DeliveryEventType]) -> bool:
+    """True when the whole sequence is legal: a CORRECTION is never first, and the effective
+    sequence follows DELIVERY_EVENT_TRANSITIONS starting from None."""
+    events = list(events)
+    if events and events[0] is DeliveryEventType.CORRECTION:
+        return False
+    prev: DeliveryEventType | None = None
+    for ev in effective_sequence(events):
+        if ev not in DELIVERY_EVENT_TRANSITIONS[prev]:
+            return False
+        prev = ev
+    return True
 
 
 class InspectionKind(StrEnum):
