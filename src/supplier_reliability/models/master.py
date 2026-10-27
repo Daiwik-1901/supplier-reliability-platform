@@ -2,9 +2,10 @@
 
 from datetime import date, datetime
 from decimal import Decimal
+from typing import TYPE_CHECKING
 
 import sqlalchemy as sa
-from sqlalchemy.orm import Mapped, mapped_column
+from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from supplier_reliability.domain.enums import (
     CapacityVerification,
@@ -20,6 +21,10 @@ from supplier_reliability.domain.enums import (
     VerificationStatus,
 )
 from supplier_reliability.models.base import Base, UTCDateTime, enum_type
+
+if TYPE_CHECKING:
+    from supplier_reliability.models.scoring import SupplierScore
+    from supplier_reliability.models.transactions import PurchaseOrder, RiskSignal
 
 MONEY = sa.Numeric(18, 2)
 CAPACITY = sa.Numeric(14, 2)
@@ -37,6 +42,21 @@ class Supplier(Base):
     onboarding_date: Mapped[date] = mapped_column(sa.Date)
     created_at: Mapped[datetime] = mapped_column(UTCDateTime)
     updated_at: Mapped[datetime] = mapped_column(UTCDateTime)
+
+    # Relationships default to lazy="raise" (R7): load explicitly with selectinload/joins.
+    sites: Mapped[list["Site"]] = relationship(back_populates="supplier", lazy="raise")
+    contracts: Mapped[list["Contract"]] = relationship(back_populates="supplier", lazy="raise")
+    certifications: Mapped[list["SupplierCertification"]] = relationship(
+        back_populates="supplier", lazy="raise"
+    )
+    capacity_declarations: Mapped[list["CapacityDeclaration"]] = relationship(
+        back_populates="supplier", lazy="raise"
+    )
+    purchase_orders: Mapped[list["PurchaseOrder"]] = relationship(
+        back_populates="supplier", lazy="raise"
+    )
+    risk_signals: Mapped[list["RiskSignal"]] = relationship(back_populates="supplier", lazy="raise")
+    scores: Mapped[list["SupplierScore"]] = relationship(back_populates="supplier", lazy="raise")
 
 
 class Site(Base):
@@ -57,6 +77,8 @@ class Site(Base):
     effective_from: Mapped[date] = mapped_column(sa.Date)
     effective_to: Mapped[date | None] = mapped_column(sa.Date)
     created_at: Mapped[datetime] = mapped_column(UTCDateTime)
+
+    supplier: Mapped["Supplier"] = relationship(back_populates="sites", lazy="raise")
 
 
 class Contract(Base):
@@ -86,6 +108,16 @@ class Contract(Base):
     )
     created_at: Mapped[datetime] = mapped_column(UTCDateTime)
 
+    supplier: Mapped["Supplier"] = relationship(back_populates="contracts", lazy="raise")
+    site: Mapped["Site | None"] = relationship(lazy="raise")
+    prices: Mapped[list["ContractPrice"]] = relationship(back_populates="contract", lazy="raise")
+    requirements: Mapped[list["ComplianceRequirement"]] = relationship(
+        back_populates="contract", lazy="raise"
+    )
+    purchase_orders: Mapped[list["PurchaseOrder"]] = relationship(
+        back_populates="contract", lazy="raise"
+    )
+
 
 class ContractPrice(Base):
     __tablename__ = "contract_prices"
@@ -96,6 +128,8 @@ class ContractPrice(Base):
     product_category: Mapped[str] = mapped_column(sa.String(64))
     unit_of_measure: Mapped[str] = mapped_column(sa.String(16))
     unit_price: Mapped[Decimal] = mapped_column(MONEY)
+
+    contract: Mapped["Contract"] = relationship(back_populates="prices", lazy="raise")
 
 
 class ComplianceRequirement(Base):
@@ -120,13 +154,22 @@ class ComplianceRequirement(Base):
     effective_to: Mapped[date | None] = mapped_column(sa.Date)
     created_at: Mapped[datetime] = mapped_column(UTCDateTime)
 
+    contract: Mapped["Contract"] = relationship(back_populates="requirements", lazy="raise")
+    site: Mapped["Site | None"] = relationship(lazy="raise")
+
 
 class SupplierCertification(Base):
     """Append-only history: changes insert a new row that supersedes the old one (D11)."""
 
     __tablename__ = "supplier_certifications"
     __table_args__ = (
-        sa.UniqueConstraint("supplier_id", "certificate_number", "recorded_at"),
+        # Explicit name: the generated one exceeds PostgreSQL's 63-character limit.
+        sa.UniqueConstraint(
+            "supplier_id",
+            "certificate_number",
+            "recorded_at",
+            name="uq_supplier_certs_supplier_number_recorded",
+        ),
         sa.CheckConstraint("valid_to >= valid_from", name="valid_dates"),
     )
 
@@ -145,9 +188,17 @@ class SupplierCertification(Base):
     verified_at: Mapped[datetime | None] = mapped_column(UTCDateTime)
     evidence_reference: Mapped[str] = mapped_column(sa.String(500))
     supersedes_certification_id: Mapped[str | None] = mapped_column(
-        sa.ForeignKey("supplier_certifications.certification_id")
+        sa.ForeignKey(
+            "supplier_certifications.certification_id", name="fk_supplier_certs_supersedes"
+        )
     )
     recorded_at: Mapped[datetime] = mapped_column(UTCDateTime)
+
+    supplier: Mapped["Supplier"] = relationship(back_populates="certifications", lazy="raise")
+    site: Mapped["Site | None"] = relationship(lazy="raise")
+    supersedes: Mapped["SupplierCertification | None"] = relationship(
+        remote_side=[certification_id], lazy="raise"
+    )
 
 
 class CapacityDeclaration(Base):
@@ -173,3 +224,8 @@ class CapacityDeclaration(Base):
     )
     source: Mapped[str] = mapped_column(sa.String(100))
     recorded_at: Mapped[datetime] = mapped_column(UTCDateTime)
+
+    supplier: Mapped["Supplier"] = relationship(
+        back_populates="capacity_declarations", lazy="raise"
+    )
+    site: Mapped["Site | None"] = relationship(lazy="raise")

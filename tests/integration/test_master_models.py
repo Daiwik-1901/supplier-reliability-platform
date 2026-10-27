@@ -357,9 +357,9 @@ def test_certification_exact_duplicate_rejected(factory):
     commit_fails(factory, cert("CERT-2"), match="UNIQUE")
 
 
-def test_composite_unique_name_contains_all_columns():
+def test_composite_unique_has_explicit_short_name():
     names = {c.name for c in Base.metadata.tables["supplier_certifications"].constraints}
-    assert "uq_supplier_certifications_supplier_id_certificate_number_recorded_at" in names
+    assert "uq_supplier_certs_supplier_number_recorded" in names
 
 
 def test_unit_server_default(factory):
