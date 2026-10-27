@@ -109,6 +109,10 @@ def test_migrated_structure_equals_create_all(migrated_engine, created_engine):
     assert any(t["checks"] for t in created.values())  # guard: CHECK names are compared
 
 
+def _normalise(sql: str) -> str:
+    return " ".join(sql.replace('"', "").replace("`", "").split())
+
+
 def _index_and_table_sql(engine) -> dict[str, str]:
     with engine.connect() as conn:
         rows = conn.execute(
@@ -120,10 +124,6 @@ def _index_and_table_sql(engine) -> dict[str, str]:
     return {name: sql for name, sql in rows}
 
 
-def _normalise(sql: str) -> str:
-    return " ".join(sql.replace('"', "").replace("`", "").split())
-
-
 def test_partial_index_where_clauses_match(migrated_engine, created_engine):
     migrated = _index_and_table_sql(migrated_engine)
     created = _index_and_table_sql(created_engine)
@@ -131,6 +131,54 @@ def test_partial_index_where_clauses_match(migrated_engine, created_engine):
     assert partial  # guard: partial unique indexes exist
     for name, sql in partial.items():
         assert _normalise(migrated[name]) == _normalise(sql), name
+
+
+def _split_top_level(body: str) -> list[str]:
+    items, depth, start = [], 0, 0
+    for i, ch in enumerate(body):
+        depth += ch == "("
+        depth -= ch == ")"
+        if ch == "," and depth == 0:
+            items.append(body[start:i].strip())
+            start = i + 1
+    items.append(body[start:].strip())
+    return items
+
+
+def _canonical_table_sql(sql: str) -> tuple[list[str], list[str]]:
+    """(columns in order, constraints sorted). Autogenerate emits constraints sorted by name
+    while create_all keeps declaration order; that ordering is the only benign difference."""
+    sql = _normalise(sql)
+    body = sql[sql.index("(") + 1 : sql.rindex(")")]
+    items = _split_top_level(body)
+    constraint_starts = ("CONSTRAINT", "PRIMARY KEY", "UNIQUE", "CHECK", "FOREIGN KEY")
+    columns = [i for i in items if not i.startswith(constraint_starts)]
+    constraints = sorted(i for i in items if i.startswith(constraint_starts))
+    return columns, constraints
+
+
+def test_create_table_sql_matches(migrated_engine, created_engine):
+    """Normalised CREATE TABLE text (incl. CHECK expressions) is identical in both DBs."""
+    migrated = _index_and_table_sql(migrated_engine)
+    created = _index_and_table_sql(created_engine)
+    tables = set(Base.metadata.tables)
+    assert tables <= created.keys()
+    for name in sorted(tables):
+        assert _canonical_table_sql(migrated[name]) == _canonical_table_sql(created[name]), name
+
+
+def test_run_migrations_with_percent_in_path(tmp_path: Path):
+    db = tmp_path / "a%20b.db"
+    # URL database parts are percent-decoded, so a literal "%" is written as "%25"
+    url = _sqlite_url(db).replace("%", "%25")
+    run_migrations(url)
+    assert db.exists()
+    assert [p.name for p in tmp_path.iterdir()] == ["a%20b.db"]
+    engine = make_engine(url)
+    try:
+        assert "alembic_version" in sa.inspect(engine).get_table_names()
+    finally:
+        engine.dispose()
 
 
 def test_postgres_ddl_compiles():

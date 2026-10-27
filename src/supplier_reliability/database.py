@@ -52,7 +52,9 @@ _REPO_ROOT = Path(__file__).resolve().parents[2]
 def alembic_config(database_url: str) -> Config:
     """Alembic config bound to `database_url` (env.py prefers it over env var / Settings)."""
     cfg = Config(str(_REPO_ROOT / "alembic.ini"))
-    cfg.set_main_option("script_location", str(_REPO_ROOT / "alembic"))
+    # set_main_option goes through ConfigParser interpolation, so "%" must be doubled
+    script_location = str(_REPO_ROOT / "alembic").replace("%", "%%")
+    cfg.set_main_option("script_location", script_location)
     cfg.attributes["database_url"] = database_url
     return cfg
 

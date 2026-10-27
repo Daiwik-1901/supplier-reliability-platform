@@ -3,7 +3,7 @@
 import os
 
 from alembic import context
-from sqlalchemy import engine_from_config, pool
+from sqlalchemy import create_engine, pool
 from sqlalchemy.engine import make_url
 
 from supplier_reliability.config import Settings
@@ -39,8 +39,8 @@ def run_migrations_offline() -> None:
 
 def run_migrations_online() -> None:
     url = _database_url()
-    section = {"sqlalchemy.url": url.replace("%", "%%")}
-    connectable = engine_from_config(section, prefix="sqlalchemy.", poolclass=pool.NullPool)
+    # Pass the URL unchanged: it never goes through ConfigParser interpolation here.
+    connectable = create_engine(url, poolclass=pool.NullPool)
     with connectable.connect() as connection:
         context.configure(connection=connection, **_configure_kwargs(url))
         with context.begin_transaction():
