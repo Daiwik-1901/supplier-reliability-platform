@@ -1,0 +1,41 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+.venv/
+
+# Tooling caches
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.coverage
+htmlcov/
+
+# Local configuration and secrets
+.env
+.env.*
+!.env.example
+
+# Databases (generated)
+*.db
+*.sqlite
+*.sqlite3
+*.db-journal
+
+# Logs
+logs/*.log
+
+# Large generated artifacts (recreate with `srp generate --preset full`)
+data/generated/full/
+reports/tmp/
+
+# Agent scratch space
+.superpowers/
+
+# OS / editor
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/

@@ -1,0 +1,4 @@
+# Keep LF everywhere so exported datasets and checksums are identical across platforms.
+* text=auto eol=lf
+*.png binary
+*.db binary
