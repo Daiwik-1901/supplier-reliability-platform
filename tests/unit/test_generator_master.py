@@ -216,6 +216,8 @@ def test_realised_demand_capacity_ratio_tracks_profile(app_config, starter):
     total_w = sum(cfg.profiles[p].po_weight for p in ds.supplier_profiles.values())
     free = defaultdict(lambda: defaultdict(Decimal))
     for r in ds.capacity_declarations:
+        if r["verification_status"] != "VERIFIED":
+            continue  # D6: scoring sees VERIFIED declarations only
         free[r["supplier_id"]][r["period_start"]] += (
             r["available_capacity"] - r["committed_capacity"]
         )
@@ -375,3 +377,23 @@ def test_master_data_deterministic(app_config):
 def test_full_preset_counts(app_config):
     _, ds = _run(app_config, "full")
     assert len(ds.suppliers) == 1000
+
+
+def test_certification_sites_match_supplier_and_requirement_site(starter):
+    _, ds = starter
+    sites = {s["site_id"]: s["supplier_id"] for s in ds.sites}
+    for c in ds.supplier_certifications:
+        if c["site_id"] is not None:
+            assert sites[c["site_id"]] == c["supplier_id"]
+    contracts = {c["contract_id"]: c["supplier_id"] for c in ds.contracts}
+    certs = {
+        (c["supplier_id"], c["certification_type"], c["site_id"])
+        for c in ds.supplier_certifications
+    }
+    site_reqs = [r for r in ds.compliance_requirements if r["scope"] == "SITE"]
+    matched = 0
+    for r in site_reqs:
+        sid = contracts[r["contract_id"]]
+        if (sid, r["certification_type"], r["site_id"]) in certs:
+            matched += 1
+    assert matched > 0

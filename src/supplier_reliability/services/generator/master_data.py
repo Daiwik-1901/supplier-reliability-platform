@@ -27,7 +27,8 @@ from supplier_reliability.domain.enums import (
     SupplierStatus,
     VerificationStatus,
 )
-from supplier_reliability.services.generator.config import GeneratorConfig
+from supplier_reliability.domain.numeric import to_money
+from supplier_reliability.services.generator.config import GeneratorCapacityError, GeneratorConfig
 from supplier_reliability.services.generator.constants import (
     CURRENCY_FACTOR,
     MEAN_LINES_PER_PO,
@@ -69,8 +70,14 @@ _HISTORY_SUPPLIER_P = 0.30
 _SITE_COUNT_P = (0.5, 0.35, 0.15)
 
 
-def _dec(x: float) -> Decimal:
-    return Decimal(str(round(float(x), 2)))
+def _d(x: float) -> Decimal:
+    """Convert a float draw to Decimal once (via str); all later arithmetic is Decimal."""
+    return Decimal(str(x))
+
+
+def _dec(x: Decimal) -> Decimal:
+    """Money/capacity quantisation (2 dp, ROUND_HALF_UP). Floats are rejected by to_money."""
+    return to_money(x)
 
 
 def _utc(d: date, hours: int = 0) -> datetime:
@@ -95,16 +102,17 @@ def expected_monthly_demand(
     """
     del profile
     units = (
-        n_purchase_orders_for_supplier_estimate
-        * MEAN_LINES_PER_PO
-        * float(MEAN_QTY_PER_LINE)
+        _d(n_purchase_orders_for_supplier_estimate)
+        * _d(MEAN_LINES_PER_PO)
+        * MEAN_QTY_PER_LINE
         / _n_months(cfg)
     )
     return _dec(units)
 
 
-def _exact_subset(rng: np.random.Generator, n: int, k: int) -> set[int]:
-    return {int(i) for i in rng.permutation(n)[:k]}
+def _exact_subset(rng: np.random.Generator, n: int, k: int) -> list[int]:
+    """k distinct indexes in [0, n), sorted (stable order; never iterate a set while drawing)."""
+    return sorted(int(i) for i in rng.permutation(n)[:k])
 
 
 def generate_master_data(
@@ -199,7 +207,8 @@ def _gen_sites(
         row = rows[extras[pos]]
         row["site_status"] = SiteStatus.INACTIVE
         row["effective_to"] = ref_start + timedelta(days=int(rng.integers(59, 481)))
-        assert row["effective_to"] <= ref_end
+        if row["effective_to"] > ref_end:
+            raise GeneratorCapacityError("inactive site effective_to fell outside the period")
     ds.sites.extend(rows)
 
 
@@ -229,7 +238,9 @@ def _gen_contracts(
     n_sites: dict[str, int] = {}
     for s in ds.sites:
         n_sites[s["supplier_id"]] = n_sites.get(s["supplier_id"], 0) + 1
-    renewed = _exact_subset(rng, len(ds.suppliers), round(_RENEWAL_FRACTION * len(ds.suppliers)))
+    renewed = set(
+        _exact_subset(rng, len(ds.suppliers), round(_RENEWAL_FRACTION * len(ds.suppliers)))
+    )
     rows: list[dict[str, Any]] = []
     for i, sup in enumerate(ds.suppliers):
         sid = sup["supplier_id"]
@@ -257,7 +268,7 @@ def _gen_contracts(
         for eff_from, eff_to, status in spans:
             created = _utc(eff_from, 10) - timedelta(days=int(rng.integers(1, 30)))
             created = max(created, _utc(sup["onboarding_date"], 10))
-            ceiling = max(50.0, float(demand[sid]) * float(rng.uniform(1.3, 2.2)))
+            ceiling = max(Decimal(50), demand[sid] * _d(round(float(rng.uniform(1.3, 2.2)), 4)))
             rows.append(
                 {
                     "contract_id": ids.next("contract"),
@@ -283,19 +294,21 @@ def _gen_contracts(
 def _gen_prices(rs: RandomSource, ids: IdRegistry, ds: GeneratedDataset) -> None:
     rng = rs.stream("prices")
     sup = {s["supplier_id"]: s for s in ds.suppliers}
-    last: dict[tuple[str, str], float] = {}
+    last: dict[tuple[str, str], Decimal] = {}
     for c in ds.contracts:
         category = sup[c["supplier_id"]]["supplier_category"]
         factor = CURRENCY_FACTOR[c["currency"]]
         for product, uom, base in PRODUCT_CATEGORIES[category]:
             key = (c["supplier_id"], product)
             if key in last:  # renewal: price drifts up a little
-                price = last[key] * (1 + float(rng.uniform(0.01, 0.06)))
+                price = last[key] * (1 + _d(round(float(rng.uniform(0.01, 0.06)), 4)))
             else:
-                price = base * factor * float(rng.lognormal(0.0, 0.15))
-            price = max(0.01, round(price, 2))
+                price = _d(base) * _d(factor) * _d(round(float(rng.lognormal(0.0, 0.15)), 4))
+            price = max(Decimal("0.01"), _dec(price))
             last[key] = price
-            price_id = ids.next("contract_price")  # CPR-nnnnnn; the column is an integer key
+            # CPR-nnnnnn; the column is an integer key. On PostgreSQL the loader must reset the
+            # sequence after this explicit-id bulk insert.
+            price_id = ids.next("contract_price")
             ds.contract_prices.append(
                 {
                     "contract_price_id": int(price_id.split("-")[1]),
@@ -465,17 +478,19 @@ def _gen_capacity(
     sites_by_supplier: dict[str, list[dict[str, Any]]] = {}
     for s in ds.sites:
         sites_by_supplier.setdefault(s["supplier_id"], []).append(s)
-    none_set = _exact_subset(
-        rng, len(ds.suppliers), round(_NO_CAPACITY_SUPPLIER_FRACTION * len(ds.suppliers))
+    none_set = set(
+        _exact_subset(
+            rng, len(ds.suppliers), round(_NO_CAPACITY_SUPPLIER_FRACTION * len(ds.suppliers))
+        )
     )
     for i, sup in enumerate(ds.suppliers):
         if i in none_set:
             continue
         sid = sup["supplier_id"]
-        ratio = cfg.profiles[ds.supplier_profiles[sid]].demand_capacity_ratio
-        base_free = float(demand[sid]) / ratio
+        ratio = _d(cfg.profiles[ds.supplier_profiles[sid]].demand_capacity_ratio)
+        base_free = demand[sid] / ratio
         sites = sites_by_supplier[sid]
-        weights = {s["site_id"]: float(rng.uniform(0.5, 1.5)) for s in sites}
+        weights = {s["site_id"]: _d(round(float(rng.uniform(0.5, 1.5)), 4)) for s in sites}
         for month in months:
             last_day = calendar.monthrange(month.year, month.month)[1]
             month_end = date(month.year, month.month, last_day)
@@ -485,19 +500,24 @@ def _gen_capacity(
                 if s["effective_from"] <= month_end
                 and (s["effective_to"] is None or s["effective_to"] >= month)
             ]
-            month_free = base_free * float(rng.lognormal(0.0, 0.08))
-            total_w = sum(weights[s["site_id"]] for s in active)
+            month_free = base_free * _d(round(float(rng.lognormal(0.0, 0.08)), 4))
+            unverified = {s["site_id"]: bool(rng.random() < _UNVERIFIED_FRACTION) for s in active}
+            # Size the VERIFIED rows (the ones scoring sees, D6) to carry the target free
+            # capacity; UNVERIFIED rows get their own, unscored values.
+            verified_w = sum((weights[k] for k, u in unverified.items() if not u), Decimal(0))
+            all_w = sum((weights[s["site_id"]] for s in active), Decimal(0))
             for s in active:
-                free = max(1.0, month_free * weights[s["site_id"]] / total_w)
-                commit_frac = round(float(rng.uniform(0.25, 0.65)), 2)
+                key = s["site_id"]
+                denom = all_w if unverified[key] else verified_w
+                free = max(Decimal(1), month_free * weights[key] / denom)
+                commit_frac = _d(round(float(rng.uniform(0.25, 0.65)), 2))
                 available = _dec(free / (1 - commit_frac))
-                committed = (available * Decimal(str(commit_frac))).quantize(Decimal("0.01"))
-                unverified = bool(rng.random() < _UNVERIFIED_FRACTION)
+                committed = _dec(available * commit_frac)
                 ds.capacity_declarations.append(
                     {
                         "capacity_declaration_id": ids.next("capacity_declaration"),
                         "supplier_id": sid,
-                        "site_id": s["site_id"],
+                        "site_id": key,
                         "period_start": month,
                         "period_end": month_end,
                         "unit": "units/month",
@@ -505,11 +525,13 @@ def _gen_capacity(
                         "committed_capacity": committed,
                         "verification_status": (
                             CapacityVerification.UNVERIFIED
-                            if unverified
+                            if unverified[key]
                             else CapacityVerification.VERIFIED
                         ),
                         "source": (
-                            "SYNTHETIC_SELF_DECLARED" if unverified else "SYNTHETIC_SUPPLIER_AUDIT"
+                            "SYNTHETIC_SELF_DECLARED"
+                            if unverified[key]
+                            else "SYNTHETIC_SUPPLIER_AUDIT"
                         ),
                         "recorded_at": _utc(month) - timedelta(days=7),
                     }
