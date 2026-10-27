@@ -6,7 +6,11 @@ from supplier_reliability.services.generator.config import GeneratorCapacityErro
 
 
 def assign_profiles(n: int, shares: dict[str, float], rng: np.random.Generator) -> list[str]:
-    """Exactly round(share*n) per profile; ``average`` absorbs the rounding remainder."""
+    """Exactly round(share*n) per profile; ``average`` absorbs the rounding remainder.
+
+    ``round`` is Python's banker's rounding (round half to even): 3.5 -> 4, 2.5 -> 2.
+    Profile names are sorted first so YAML ordering never changes the assignment.
+    """
     if "average" not in shares:
         raise ValueError("shares must include 'average'")
     counts = {name: round(share * n) for name, share in shares.items()}
@@ -14,7 +18,7 @@ def assign_profiles(n: int, shares: dict[str, float], rng: np.random.Generator) 
     counts["average"] = n - others
     if counts["average"] < 0:
         raise GeneratorCapacityError("profile counts exceed n even with average at zero")
-    labels = [name for name, c in counts.items() for _ in range(c)]
+    labels = [name for name, c in sorted(counts.items()) for _ in range(c)]
     order = rng.permutation(len(labels))
     return [labels[i] for i in order]
 
@@ -34,6 +38,10 @@ def allocate_exact(
     """
     w = np.asarray(weights, dtype=float)
     k = len(w)
+    if minimum < 0:
+        raise ValueError("minimum must be nonnegative")
+    if not np.isfinite(w).all():
+        raise ValueError("weights must be finite")
     if k == 0 or (w < 0).any() or w.sum() <= 0:
         raise GeneratorCapacityError("weights must be nonnegative with a positive sum")
     if maximum is not None and maximum < minimum:

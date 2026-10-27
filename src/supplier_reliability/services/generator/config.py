@@ -6,9 +6,15 @@ from datetime import datetime
 
 from pydantic import BaseModel, ConfigDict
 
-from supplier_reliability.config import AnomalyConfig, AppConfig, ProfileParams
+from supplier_reliability.config import AnomalyConfig, AnomalyPreset, AppConfig, ProfileParams
 
-__all__ = ["AnomalyConfig", "GeneratorCapacityError", "GeneratorConfig", "ProfileParams"]
+__all__ = [
+    "AnomalyConfig",
+    "AnomalyPreset",
+    "GeneratorCapacityError",
+    "GeneratorConfig",
+    "ProfileParams",
+]
 
 
 class GeneratorCapacityError(ValueError):
@@ -27,7 +33,8 @@ class GeneratorConfig(BaseModel):
     reference_start: datetime
     reference_end: datetime
     profiles: dict[str, ProfileParams]
-    anomalies: AnomalyConfig
+    anomaly_preset: AnomalyPreset
+    e_cross_supplier_fraction: float
 
     @classmethod
     def from_app_config(
@@ -37,6 +44,9 @@ class GeneratorConfig(BaseModel):
         if preset not in gen.presets:
             raise ValueError(f"unknown preset {preset!r}; known: {sorted(gen.presets)}")
         counts = gen.presets[preset]
+        anomaly_preset = getattr(app_config.anomalies, preset, None)
+        if not isinstance(anomaly_preset, AnomalyPreset):
+            raise ValueError(f"no anomaly configuration for preset {preset!r}")
         return cls(
             seed=gen.seed if seed is None else seed,
             preset=preset,
@@ -47,7 +57,8 @@ class GeneratorConfig(BaseModel):
             reference_start=datetime.fromisoformat(gen.reference_period["start"]),
             reference_end=datetime.fromisoformat(gen.reference_period["end"]),
             profiles=gen.profiles,
-            anomalies=app_config.anomalies,
+            anomaly_preset=anomaly_preset,
+            e_cross_supplier_fraction=app_config.anomalies.e_cross_supplier_fraction,
         )
 
     def canonical_json(self) -> str:

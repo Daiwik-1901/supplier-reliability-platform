@@ -1,3 +1,4 @@
+# ruff: noqa: E501  (the D10 literal table is kept one row per profile)
 import numpy as np
 import pytest
 
@@ -106,13 +107,164 @@ def test_assign_profiles_exact_counts(app_config):
 def test_assign_profiles_small_n_follows_rule(app_config):
     shares = _shares(app_config)
     out = assign_profiles(50, shares, RandomSource(1).stream("p"))
+    # Python round() is banker's rounding: 3.5 -> 4, 2.5 -> 2.
+    expected = {
+        "stable_high": 10,
+        "average": 13,
+        "deteriorating_lead_time": 5,
+        "quality_issues": 4,
+        "invoice_discrepancy": 4,
+        "capacity_constrained": 4,
+        "compliance_risk": 3,
+        "disruption_prone": 3,
+        "sparse_history": 2,
+        "recovering": 2,
+    }
+    assert {k: out.count(k) for k in shares} == expected
     assert len(out) == 50
-    others = 0
-    for k, s in shares.items():
-        if k != "average":
-            assert out.count(k) == round(s * 50)
-            others += round(s * 50)
-    assert out.count("average") == 50 - others
+
+
+def test_assign_profiles_independent_of_dict_order(app_config):
+    shares = _shares(app_config)
+    reordered = dict(reversed(list(shares.items())))
+    a = assign_profiles(100, shares, RandomSource(1).stream("p"))
+    b = assign_profiles(100, reordered, RandomSource(1).stream("p"))
+    assert a == b
+
+
+D10 = {
+    # share, po_weight, on_time_p, mean_late_days, defect_mean, inv_p, inv_mag, dcr, cert, risk
+    "stable_high": (0.20, 1.2, (0.97, 0.97), (1, 1), (0.005, 0.005), 0.02, 0.01, 0.55, 0.02, 0.5),
+    "average": (0.25, 1.0, (0.88, 0.88), (3, 3), (0.02, 0.02), 0.08, 0.02, 0.70, 0.05, 1),
+    "deteriorating_lead_time": (
+        0.10,
+        1.0,
+        (0.92, 0.55),
+        (6, 6),
+        (0.02, 0.02),
+        0.08,
+        0.02,
+        0.75,
+        0.05,
+        1.5,
+    ),
+    "quality_issues": (0.08, 1.0, (0.88, 0.85), (3, 3), (0.07, 0.07), 0.08, 0.02, 0.70, 0.05, 1),
+    "invoice_discrepancy": (
+        0.08,
+        1.0,
+        (0.88, 0.88),
+        (3, 3),
+        (0.02, 0.02),
+        0.45,
+        0.09,
+        0.70,
+        0.05,
+        1,
+    ),
+    "capacity_constrained": (
+        0.07,
+        1.3,
+        (0.80, 0.75),
+        (5, 5),
+        (0.03, 0.03),
+        0.08,
+        0.02,
+        1.35,
+        0.05,
+        1.5,
+    ),
+    "compliance_risk": (0.06, 0.9, (0.86, 0.86), (3, 3), (0.025, 0.025), 0.08, 0.02, 0.70, 0.60, 1),
+    "disruption_prone": (0.06, 0.9, (0.80, 0.70), (7, 7), (0.03, 0.03), 0.08, 0.02, 0.80, 0.05, 6),
+    "sparse_history": (0.05, 0.1, (0.85, 0.85), (4, 4), (0.02, 0.02), 0.08, 0.02, 0.60, 0.10, 0.2),
+    "recovering": (0.05, 1.0, (0.60, 0.93), (6, 2), (0.06, 0.015), 0.08, 0.02, 0.85, 0.05, 1),
+}
+D10_FIELDS = (
+    "share",
+    "po_weight",
+    "on_time_p",
+    "mean_late_days",
+    "defect_mean",
+    "invoice_variance_p",
+    "invoice_variance_magnitude",
+    "demand_capacity_ratio",
+    "cert_expiry_p",
+    "risk_signals_per_year",
+)
+
+
+def test_yaml_profiles_match_d10_table(app_config):
+    profiles = app_config.generator.profiles
+    assert set(profiles) == set(D10)
+    for name, row in D10.items():
+        for field, want in zip(D10_FIELDS, row, strict=True):
+            got = getattr(profiles[name], field)
+            if isinstance(want, tuple):
+                assert tuple(got) == pytest.approx(want), (name, field)
+            else:
+                assert got == pytest.approx(want), (name, field)
+    assert sum(p.share for p in profiles.values()) == pytest.approx(1.0, abs=1e-9)
+
+
+def test_anomaly_preset_resolved_by_construction(app_config):
+    starter = GeneratorConfig.from_app_config(app_config, "starter")
+    full = GeneratorConfig.from_app_config(app_config, "full")
+    assert starter.anomaly_preset.positives_per_class == 5
+    assert starter.anomaly_preset.negatives == {
+        "shipments": 40,
+        "delivery_event_pairs": 40,
+        "risk_signals": 30,
+        "scores": 30,
+    }
+    assert full.anomaly_preset.positives_per_class == 25
+    assert full.anomaly_preset.negatives["shipments"] == 500
+    assert starter.e_cross_supplier_fraction == 0.6
+
+
+def test_missing_anomaly_entry_raises(app_config):
+    data = app_config.model_dump()
+    data["generator"]["presets"]["tiny"] = {
+        "suppliers": 5,
+        "purchase_orders": 10,
+        "shipments": 15,
+        "inspections": 20,
+    }
+    cfg = type(app_config).model_validate(data)
+    with pytest.raises(ValueError, match="anomaly"):
+        GeneratorConfig.from_app_config(cfg, "tiny")
+
+
+def test_dataset_id_ignores_other_presets_anomalies(app_config):
+    base = GeneratorConfig.from_app_config(app_config, "starter")
+    data = app_config.model_dump()
+    data["anomalies"]["full"]["positives_per_class"] = 99
+    other = type(app_config).model_validate(data)
+    assert GeneratorConfig.from_app_config(other, "starter").dataset_id == base.dataset_id
+    data["anomalies"]["starter"]["positives_per_class"] = 6
+    changed = type(app_config).model_validate(data)
+    assert GeneratorConfig.from_app_config(changed, "starter").dataset_id != base.dataset_id
+
+
+def test_allocate_exact_rejects_bad_inputs():
+    rng = RandomSource(3).stream("a")
+    with pytest.raises(ValueError):
+        allocate_exact(10, np.array([1.0, np.nan]), 0, rng)
+    with pytest.raises(ValueError):
+        allocate_exact(10, np.array([1.0, np.inf]), 0, rng)
+    with pytest.raises(ValueError):
+        allocate_exact(10, np.ones(2), -1, rng)
+
+
+def test_allocate_exact_boundaries():
+    rng = RandomSource(3).stream("a")
+    assert allocate_exact(6, np.array([1.0, 5.0, 2.0]), 2, rng).tolist() == [2, 2, 2]
+    even = allocate_exact(9, np.array([1.0, 1.0, 1.0]), 0, rng, maximum=3)
+    assert even.tolist() == [3, 3, 3]
+    # zero-weight slot with binding maximum: weight-1 slots cap at 4, remainder must go to slot 0
+    out = allocate_exact(10, np.array([0.0, 1.0, 1.0]), 0, rng, maximum=4)
+    assert out.sum() == 10 and out.max() <= 4 and out[0] == 2
+    # all open weights zero: even-split branch
+    out = allocate_exact(3, np.array([1.0, 0.0, 0.0]), 0, rng, maximum=1)
+    assert out.tolist() == [1, 1, 1]
 
 
 def test_assign_profiles_deterministic_and_shuffled(app_config):
