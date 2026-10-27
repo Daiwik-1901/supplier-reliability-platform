@@ -1,13 +1,12 @@
 from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal
-from pathlib import Path
 
 import pytest
 import sqlalchemy as sa
 from sqlalchemy.exc import IntegrityError, InvalidRequestError, StatementError
 from sqlalchemy.orm import selectinload
 
-from supplier_reliability.database import make_engine, make_session_factory, session_scope
+from supplier_reliability.database import make_session_factory, session_scope
 from supplier_reliability.models import (
     Base,
     Contract,
@@ -37,11 +36,8 @@ D = Decimal
 
 
 @pytest.fixture
-def factory(tmp_path: Path):
-    engine = make_engine(f"sqlite:///{tmp_path}/t.db")
-    Base.metadata.create_all(engine)
-    yield make_session_factory(engine)
-    engine.dispose()
+def factory(migrated_engine):
+    return make_session_factory(migrated_engine)
 
 
 def add_in_order(session, *objs):

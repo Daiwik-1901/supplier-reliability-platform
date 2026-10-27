@@ -1,12 +1,11 @@
 from datetime import UTC, date, datetime, timedelta, timezone
 from decimal import Decimal
-from pathlib import Path
 
 import pytest
 import sqlalchemy as sa
 from sqlalchemy.exc import IntegrityError, StatementError
 
-from supplier_reliability.database import make_engine, make_session_factory, session_scope
+from supplier_reliability.database import make_session_factory, session_scope
 from supplier_reliability.models.base import Base
 from supplier_reliability.models.master import (
     CapacityDeclaration,
@@ -22,11 +21,8 @@ T0 = datetime(2025, 1, 1, tzinfo=UTC)
 
 
 @pytest.fixture
-def factory(tmp_path: Path):
-    engine = make_engine(f"sqlite:///{tmp_path}/m.db")
-    Base.metadata.create_all(engine)
-    yield make_session_factory(engine)
-    engine.dispose()
+def factory(migrated_engine):
+    return make_session_factory(migrated_engine)
 
 
 def supplier(sid="SUP-000001", **kw) -> Supplier:

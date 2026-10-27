@@ -2,7 +2,10 @@
 
 from collections.abc import Iterator
 from contextlib import contextmanager
+from pathlib import Path
 
+from alembic import command
+from alembic.config import Config
 from sqlalchemy import Engine, create_engine, event
 from sqlalchemy.engine import make_url
 from sqlalchemy.orm import Session, sessionmaker
@@ -41,3 +44,19 @@ def session_scope(factory: sessionmaker[Session]) -> Iterator[Session]:
         raise
     finally:
         session.close()
+
+
+_REPO_ROOT = Path(__file__).resolve().parents[2]
+
+
+def alembic_config(database_url: str) -> Config:
+    """Alembic config bound to `database_url` (env.py prefers it over env var / Settings)."""
+    cfg = Config(str(_REPO_ROOT / "alembic.ini"))
+    cfg.set_main_option("script_location", str(_REPO_ROOT / "alembic"))
+    cfg.attributes["database_url"] = database_url
+    return cfg
+
+
+def run_migrations(database_url: str) -> None:
+    """Upgrade the database at `database_url` to the latest revision."""
+    command.upgrade(alembic_config(database_url), "head")
