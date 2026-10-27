@@ -48,7 +48,7 @@ def test_threshold_not_covering_zero_to_hundred_rejected(app_config):
 
 
 def test_profile_shares_must_sum_to_one(app_config):
-    assert abs(sum(p["share"] for p in app_config.generator.profiles.values()) - 1.0) < 1e-9
+    assert abs(sum(p.share for p in app_config.generator.profiles.values()) - 1.0) < 1e-9
     data = _data(app_config)
     data["generator"]["profiles"]["average"]["share"] = 0.30
     with pytest.raises(ValidationError):

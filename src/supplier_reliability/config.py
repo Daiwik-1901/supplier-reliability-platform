@@ -4,7 +4,7 @@ import hashlib
 import json
 from functools import lru_cache
 from pathlib import Path
-from typing import Any, Literal
+from typing import Literal
 
 import yaml
 from pydantic import BaseModel, ConfigDict, model_validator
@@ -113,19 +113,46 @@ class ScoringConfig(_Strict):
         return self
 
 
-class GeneratorSettingsBlock(_Strict):
-    """Generator parameters. Loosely typed here; Task 5 defines the typed GeneratorConfig."""
+Trend = tuple[float, float]  # (value at reference_start, value at reference_end)
 
+
+class ProfileParams(_Strict):
+    """One D10 supplier profile. Trend fields are (start, end) pairs; the rest are scalars."""
+
+    share: float
+    po_weight: float
+    on_time_p: Trend
+    mean_late_days: Trend
+    defect_mean: Trend
+    invoice_variance_p: float
+    invoice_variance_magnitude: float
+    demand_capacity_ratio: float
+    cert_expiry_p: float
+    risk_signals_per_year: float
+
+    def at(self, field: str, fraction: float) -> float:
+        """Value of ``field`` at ``fraction`` of the reference period (0 = start, 1 = end).
+
+        Trend fields interpolate linearly; scalar fields are returned unchanged.
+        """
+        if field not in type(self).model_fields:
+            raise KeyError(field)
+        value = getattr(self, field)
+        if isinstance(value, tuple):
+            start, end = value
+            return start + (end - start) * fraction
+        return float(value)
+
+
+class GeneratorSettingsBlock(_Strict):
     seed: int
     reference_period: dict[str, str]
     presets: dict[str, dict[str, int]]
-    profiles: dict[str, dict[str, Any]]
+    profiles: dict[str, ProfileParams]
 
     @model_validator(mode="after")
     def _check_profile_shares(self) -> "GeneratorSettingsBlock":
-        if any("share" not in p for p in self.profiles.values()):
-            raise ValueError("every profile must define 'share'")
-        total = sum(p["share"] for p in self.profiles.values())
+        total = sum(p.share for p in self.profiles.values())
         if abs(total - 1.0) > TOLERANCE:
             raise ValueError(f"profile shares must sum to 1, got {total}")
         return self
