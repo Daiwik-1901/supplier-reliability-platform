@@ -4,7 +4,7 @@ from pathlib import Path
 
 import pytest
 import sqlalchemy as sa
-from sqlalchemy.exc import IntegrityError, InvalidRequestError
+from sqlalchemy.exc import IntegrityError, InvalidRequestError, StatementError
 from sqlalchemy.orm import selectinload
 
 from supplier_reliability.database import make_engine, make_session_factory, session_scope
@@ -272,9 +272,16 @@ def seed_chain(factory, with_line=True):
             add_in_order(s, mk_alloc())
 
 
+def mk_snapshot(config_hash="c" * 64):
+    return ScoringConfigSnapshot(
+        config_hash=config_hash, scoring_version="1.0.0", config={"w": 1}, created_at=T0
+    )
+
+
 def seed_supplier(factory):
+    """Supplier plus the config snapshot that mk_score() references."""
     with session_scope(factory) as s:
-        s.add(mk_supplier())
+        add_in_order(s, mk_supplier(), mk_snapshot())
 
 
 # ---- brief tests ---------------------------------------------------------------------------
@@ -628,15 +635,32 @@ def test_exception_requires_raw_record_and_optional_links_checked(factory):
     commit_fails(factory, mk_exc(corrected_score_id="SCORE-NOPE"), match="FOREIGN KEY")
 
 
+def test_validation_finding_severity_uses_shared_enum(factory):
+    with session_scope(factory) as s:
+        s.add(ValidationRun(run_id="RUN-1", started_at=T0, scope="all", finding_counts={}))
+    with pytest.raises(StatementError, match="ERROR"), session_scope(factory) as s:
+        s.add(
+            ValidationFinding(
+                run_id="RUN-1",
+                rule_id="X",
+                severity="ERROR",
+                entity_type="INVOICE",
+                message="m",
+                detection_timestamp=T0,
+                is_expected_anomaly=False,
+            )
+        )
+
+
 def test_validation_run_and_findings(factory):
     with session_scope(factory) as s:
         add_in_order(
             s,
-            ValidationRun(run_id="RUN-1", started_at=T0, scope="all", finding_counts={"ERROR": 1}),
+            ValidationRun(run_id="RUN-1", started_at=T0, scope="all", finding_counts={"HIGH": 1}),
             ValidationFinding(
                 run_id="RUN-1",
                 rule_id="DC-007",
-                severity="ERROR",
+                severity="HIGH",
                 entity_type="INVOICE",
                 entity_id="INV-1",
                 field="invoiced_amount",
@@ -652,7 +676,7 @@ def test_validation_run_and_findings(factory):
         ValidationFinding(
             run_id="RUN-NOPE",
             rule_id="X",
-            severity="ERROR",
+            severity="HIGH",
             entity_type="INVOICE",
             message="m",
             detection_timestamp=T0,
@@ -707,31 +731,36 @@ def test_all_constraint_and_index_names_fit_postgres_limit():
     assert too_long == []
 
 
-def test_every_foreign_key_column_is_covered_by_an_index_or_key():
-    # Child-side FK lookups (selectinload) must not scan: leading column of an index/PK/unique.
+def unindexed_foreign_keys(metadata=Base.metadata) -> list[str]:
+    """FK columns that are not the leading column of an index, PK or unique constraint."""
     gaps = []
-    for table in Base.metadata.tables.values():
-        covered = {ix.columns.values()[0].name for ix in table.indexes}
-        covered |= {c.columns.values()[0].name for c in table.constraints if len(c.columns)}
-        for fk in table.foreign_keys:
-            if fk.parent.name not in covered:
-                gaps.append(f"{table.name}.{fk.parent.name}")
-    # Optional, rarely traversed links are allowed to be unindexed; the hot ones must not be.
-    hot = {
-        "shipments.po_id",
-        "po_lines.po_id",
-        "shipment_lines.po_line_id",
-        "inspections.shipment_line_id",
-        "delivery_events.shipment_id",
-        "invoices.shipment_id",
-        "invoices.po_id",
-        "risk_signals.supplier_id",
-        "supplier_scores.supplier_id",
-        "score_evidence.score_id",
-        "data_exceptions.raw_record_id",
-        "validation_findings.run_id",
-    }
-    assert hot.isdisjoint(gaps), hot & set(gaps)
+    for table in metadata.tables.values():
+        covered = {ix.columns.values()[0].name for ix in table.indexes if len(ix.columns)}
+        covered |= {
+            c.columns.values()[0].name
+            for c in table.constraints
+            if isinstance(c, sa.PrimaryKeyConstraint | sa.UniqueConstraint) and len(c.columns)
+        }
+        gaps += [
+            f"{table.name}.{fk.parent.name}"
+            for fk in table.foreign_keys
+            if fk.parent.name not in covered
+        ]
+    return sorted(gaps)
+
+
+def test_every_foreign_key_column_is_covered_by_an_index_or_key():
+    assert unindexed_foreign_keys() == []
+
+
+def test_fk_index_check_detects_a_missing_index():
+    table = Base.metadata.tables["risk_signals"]
+    ix = next(i for i in table.indexes if [c.name for c in i.columns] == ["site_id"])
+    table.indexes.discard(ix)
+    try:
+        assert "risk_signals.site_id" in unindexed_foreign_keys()
+    finally:
+        table.indexes.add(ix)
 
 
 def seed_graph(factory):
@@ -808,3 +837,56 @@ def test_relationship_assignment_orders_inserts_without_manual_flush(factory):
     with session_scope(factory) as s:
         got = s.scalars(sa.select(Supplier).options(selectinload(Supplier.sites))).one()
         assert [x.site_id for x in got.sites] == ["SITE-SUP-000001-01"]
+
+
+def test_score_requires_existing_config_snapshot(factory):
+    with session_scope(factory) as s:
+        s.add(mk_supplier())
+    commit_fails(factory, mk_score(), match="FOREIGN KEY")
+    with session_scope(factory) as s:
+        add_in_order(s, mk_snapshot(), mk_score())
+    with session_scope(factory) as s:
+        assert s.get(SupplierScore, "SCORE-2026-000001").config_hash == "c" * 64
+
+
+def test_supersession_in_one_transaction_working_order(factory):
+    seed_supplier(factory)
+    with session_scope(factory) as s:
+        s.add(mk_score())
+    with session_scope(factory) as s:
+        v1 = s.get(SupplierScore, "SCORE-2026-000001")
+        v1.is_current = False
+        s.flush()
+        v2 = mk_score("SCORE-2026-000002", version=2)
+        s.add(v2)
+        s.flush()
+        v1.superseded_by_score_id = v2.score_id
+        s.flush()
+    with session_scope(factory) as s:
+        rows = {r.version_number: r for r in s.scalars(sa.select(SupplierScore))}
+        assert (rows[1].is_current, rows[1].superseded_by_score_id) == (False, "SCORE-2026-000002")
+        assert (rows[2].is_current, rows[2].superseded_by_score_id) == (True, None)
+
+
+def test_supersession_inserting_new_current_before_demoting_fails(factory):
+    seed_supplier(factory)
+    with session_scope(factory) as s:
+        s.add(mk_score())
+    with pytest.raises(IntegrityError, match="UNIQUE"), session_scope(factory) as s:
+        s.add(mk_score("SCORE-2026-000002", version=2))
+        s.flush()
+
+
+def test_supersession_pointing_old_row_while_still_current_fails(factory):
+    seed_supplier(factory)
+    with session_scope(factory) as s:
+        s.add(mk_score())
+    with pytest.raises(IntegrityError, match="superseded_not_current"), session_scope(factory) as s:
+        v1 = s.get(SupplierScore, "SCORE-2026-000001")
+        v1.is_current = False
+        s.flush()
+        s.add(mk_score("SCORE-2026-000002", version=2))
+        s.flush()
+        v1.is_current = True
+        v1.superseded_by_score_id = "SCORE-2026-000002"
+        s.flush()

@@ -252,8 +252,12 @@ class RiskSignal(Base):
     risk_signal_id: Mapped[str] = mapped_column(sa.String(32), primary_key=True)
     supplier_id: Mapped[str] = mapped_column(sa.ForeignKey("suppliers.supplier_id"), index=True)
     site_id: Mapped[str | None] = mapped_column(sa.ForeignKey("sites.site_id"), index=True)
-    related_shipment_id: Mapped[str | None] = mapped_column(sa.ForeignKey("shipments.shipment_id"))
-    related_contract_id: Mapped[str | None] = mapped_column(sa.ForeignKey("contracts.contract_id"))
+    related_shipment_id: Mapped[str | None] = mapped_column(
+        sa.ForeignKey("shipments.shipment_id"), index=True
+    )
+    related_contract_id: Mapped[str | None] = mapped_column(
+        sa.ForeignKey("contracts.contract_id"), index=True
+    )
     signal_type: Mapped[RiskSignalType] = mapped_column(enum_type(RiskSignalType))
     severity: Mapped[Severity] = mapped_column(enum_type(Severity))
     signal_source: Mapped[str] = mapped_column(sa.String(100))

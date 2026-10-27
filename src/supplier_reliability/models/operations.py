@@ -63,7 +63,7 @@ class DataException(Base):
         sa.ForeignKey("suppliers.supplier_id"), index=True
     )
     corrected_score_id: Mapped[str | None] = mapped_column(
-        sa.ForeignKey("supplier_scores.score_id")
+        sa.ForeignKey("supplier_scores.score_id"), index=True
     )
 
     raw_record: Mapped["RawIngestionRecord"] = relationship(
@@ -91,7 +91,7 @@ class ValidationFinding(Base):
     finding_id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
     run_id: Mapped[str] = mapped_column(sa.ForeignKey("validation_runs.run_id"), index=True)
     rule_id: Mapped[str] = mapped_column(sa.String(32), index=True)
-    severity: Mapped[str] = mapped_column(sa.String(16))
+    severity: Mapped[Severity] = mapped_column(enum_type(Severity))
     entity_type: Mapped[str] = mapped_column(sa.String(40))
     entity_id: Mapped[str | None] = mapped_column(sa.String(64))
     field: Mapped[str | None] = mapped_column(sa.String(64))

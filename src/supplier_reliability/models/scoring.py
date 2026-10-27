@@ -36,7 +36,15 @@ def _score_range_check() -> sa.CheckConstraint:
 
 
 class SupplierScore(Base):
-    """Immutable except for is_current / superseded_by_score_id (D8)."""
+    """Immutable except for is_current / superseded_by_score_id (D8).
+
+    Supersession write order (one transaction; the partial unique index allows one current row
+    per evaluation_key and superseded_not_current forbids a current superseded row):
+      1. old.is_current = False; flush
+      2. insert new (is_current=True, version_number=old+1); flush
+      3. old.superseded_by_score_id = new.score_id; flush
+    The referenced ScoringConfigSnapshot must already exist.
+    """
 
     __tablename__ = "supplier_scores"
     __table_args__ = (
@@ -87,17 +95,21 @@ class SupplierScore(Base):
     effective_weights: Mapped[dict[str, Any]] = mapped_column(sa.JSON)
     explanation: Mapped[dict[str, Any]] = mapped_column(sa.JSON)
     scoring_version: Mapped[str] = mapped_column(sa.String(32))
-    config_hash: Mapped[str] = mapped_column(sa.String(64))
+    config_hash: Mapped[str] = mapped_column(
+        sa.ForeignKey("scoring_config_snapshots.config_hash"), index=True
+    )
     code_version: Mapped[str] = mapped_column(sa.String(32))
     evaluation_key: Mapped[str] = mapped_column(sa.String(64))
     version_number: Mapped[int] = mapped_column(sa.Integer)
     is_current: Mapped[bool] = mapped_column(sa.Boolean)
     superseded_by_score_id: Mapped[str | None] = mapped_column(
-        sa.ForeignKey("supplier_scores.score_id")
+        sa.ForeignKey("supplier_scores.score_id"), index=True
     )
     change_reason: Mapped[str | None] = mapped_column(sa.String(500))
     evidence_fingerprint: Mapped[str] = mapped_column(sa.String(64))
-    restates_score_id: Mapped[str | None] = mapped_column(sa.ForeignKey("supplier_scores.score_id"))
+    restates_score_id: Mapped[str | None] = mapped_column(
+        sa.ForeignKey("supplier_scores.score_id"), index=True
+    )
 
     supplier: Mapped["Supplier"] = relationship(back_populates="scores", lazy="raise")
     site: Mapped["Site | None"] = relationship(lazy="raise")

@@ -149,7 +149,7 @@ class ComplianceRequirement(Base):
     certification_type: Mapped[CertificationType] = mapped_column(enum_type(CertificationType))
     mandatory: Mapped[bool] = mapped_column(sa.Boolean)
     scope: Mapped[RequirementScope] = mapped_column(enum_type(RequirementScope))
-    site_id: Mapped[str | None] = mapped_column(sa.ForeignKey("sites.site_id"))
+    site_id: Mapped[str | None] = mapped_column(sa.ForeignKey("sites.site_id"), index=True)
     effective_from: Mapped[date] = mapped_column(sa.Date)
     effective_to: Mapped[date | None] = mapped_column(sa.Date)
     created_at: Mapped[datetime] = mapped_column(UTCDateTime)
@@ -175,7 +175,7 @@ class SupplierCertification(Base):
 
     certification_id: Mapped[str] = mapped_column(sa.String(40), primary_key=True)
     supplier_id: Mapped[str] = mapped_column(sa.ForeignKey("suppliers.supplier_id"), index=True)
-    site_id: Mapped[str | None] = mapped_column(sa.ForeignKey("sites.site_id"))
+    site_id: Mapped[str | None] = mapped_column(sa.ForeignKey("sites.site_id"), index=True)
     certification_type: Mapped[CertificationType] = mapped_column(enum_type(CertificationType))
     certificate_number: Mapped[str] = mapped_column(sa.String(64))
     issuing_authority: Mapped[str] = mapped_column(sa.String(200))
@@ -190,7 +190,8 @@ class SupplierCertification(Base):
     supersedes_certification_id: Mapped[str | None] = mapped_column(
         sa.ForeignKey(
             "supplier_certifications.certification_id", name="fk_supplier_certs_supersedes"
-        )
+        ),
+        index=True,
     )
     recorded_at: Mapped[datetime] = mapped_column(UTCDateTime)
 
@@ -211,7 +212,7 @@ class CapacityDeclaration(Base):
 
     capacity_declaration_id: Mapped[str] = mapped_column(sa.String(40), primary_key=True)
     supplier_id: Mapped[str] = mapped_column(sa.ForeignKey("suppliers.supplier_id"), index=True)
-    site_id: Mapped[str | None] = mapped_column(sa.ForeignKey("sites.site_id"))
+    site_id: Mapped[str | None] = mapped_column(sa.ForeignKey("sites.site_id"), index=True)
     period_start: Mapped[date] = mapped_column(sa.Date)
     period_end: Mapped[date] = mapped_column(sa.Date)
     unit: Mapped[str] = mapped_column(
