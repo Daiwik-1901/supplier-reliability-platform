@@ -1,0 +1,178 @@
+# Default configuration. Changing any scoring parameter requires bumping scoring.scoring_version.
+scoring:
+  scoring_version: "1.0.0"
+  weights:
+    delivery: 0.30
+    quality: 0.25
+    cost: 0.15
+    capacity: 0.10
+    compliance: 0.10
+    disruption: 0.10
+  category_thresholds:   # lower inclusive, upper exclusive (the top band includes 100)
+    HIGH: {lower: 85, upper: 100}
+    ACCEPTABLE: {lower: 70, upper: 85}
+    AT_RISK: {lower: 50, upper: 70}
+    CRITICAL: {lower: 0, upper: 50}
+  grace_hours: 24
+  min_observations:
+    delivery: 5
+    quality: 3
+    cost: 3
+  coverage_threshold: 0.70
+  delivery:
+    delay_penalty_per_day: 2
+    delay_penalty_cap: 20
+  defect_rate_zero_score: 0.10
+  variance_zero_score: 0.10
+  underbilling_weight: 0.5
+  capacity_breakpoints:   # utilisation -> score; linear between points, 0 beyond the last
+    - {utilization: 0.80, score: 100}
+    - {utilization: 1.00, score: 70}
+    - {utilization: 1.50, score: 0}
+  compliance_points:
+    COMPLIANT: 100
+    PENDING_VERIFICATION: 50
+    EXPIRED: 0
+    NONCOMPLIANT: 0
+  severity_weights:
+    NONE: 0
+    LOW: 5
+    MEDIUM: 15
+    HIGH: 30
+    CRITICAL: 50
+  recency_days: 90
+  lookback_days: 180
+  resolved_multiplier: 0.5
+  inactive_site_multiplier: 0.5
+  dedup_window_days: 7
+  deteriorating_threshold: 10
+
+generator:
+  seed: 20261022
+  reference_period:
+    start: "2025-01-01T00:00:00Z"
+    end: "2026-06-30T23:59:59Z"
+  presets:
+    starter: {suppliers: 50, purchase_orders: 300, shipments: 450, inspections: 600}
+    full: {suppliers: 1000, purchase_orders: 10000, shipments: 15000, inspections: 20000}
+  # Trend columns are [start, end] pairs interpolated linearly over the reference period.
+  profiles:
+    stable_high:
+      share: 0.20
+      po_weight: 1.2
+      on_time_p: [0.97, 0.97]
+      mean_late_days: [1, 1]
+      defect_mean: [0.005, 0.005]
+      invoice_variance_p: 0.02
+      invoice_variance_magnitude: 0.01
+      demand_capacity_ratio: 0.55
+      cert_expiry_p: 0.02
+      risk_signals_per_year: 0.5
+    average:
+      share: 0.25
+      po_weight: 1.0
+      on_time_p: [0.88, 0.88]
+      mean_late_days: [3, 3]
+      defect_mean: [0.02, 0.02]
+      invoice_variance_p: 0.08
+      invoice_variance_magnitude: 0.02
+      demand_capacity_ratio: 0.70
+      cert_expiry_p: 0.05
+      risk_signals_per_year: 1
+    deteriorating_lead_time:
+      share: 0.10
+      po_weight: 1.0
+      on_time_p: [0.92, 0.55]
+      mean_late_days: [6, 6]
+      defect_mean: [0.02, 0.02]
+      invoice_variance_p: 0.08
+      invoice_variance_magnitude: 0.02
+      demand_capacity_ratio: 0.75
+      cert_expiry_p: 0.05
+      risk_signals_per_year: 1.5
+    quality_issues:
+      share: 0.08
+      po_weight: 1.0
+      on_time_p: [0.88, 0.85]
+      mean_late_days: [3, 3]
+      defect_mean: [0.07, 0.07]
+      invoice_variance_p: 0.08
+      invoice_variance_magnitude: 0.02
+      demand_capacity_ratio: 0.70
+      cert_expiry_p: 0.05
+      risk_signals_per_year: 1
+    invoice_discrepancy:
+      share: 0.08
+      po_weight: 1.0
+      on_time_p: [0.88, 0.88]
+      mean_late_days: [3, 3]
+      defect_mean: [0.02, 0.02]
+      invoice_variance_p: 0.45
+      invoice_variance_magnitude: 0.09
+      demand_capacity_ratio: 0.70
+      cert_expiry_p: 0.05
+      risk_signals_per_year: 1
+    capacity_constrained:
+      share: 0.07
+      po_weight: 1.3
+      on_time_p: [0.80, 0.75]
+      mean_late_days: [5, 5]
+      defect_mean: [0.03, 0.03]
+      invoice_variance_p: 0.08
+      invoice_variance_magnitude: 0.02
+      demand_capacity_ratio: 1.35
+      cert_expiry_p: 0.05
+      risk_signals_per_year: 1.5
+    compliance_risk:
+      share: 0.06
+      po_weight: 0.9
+      on_time_p: [0.86, 0.86]
+      mean_late_days: [3, 3]
+      defect_mean: [0.025, 0.025]
+      invoice_variance_p: 0.08
+      invoice_variance_magnitude: 0.02
+      demand_capacity_ratio: 0.70
+      cert_expiry_p: 0.60
+      risk_signals_per_year: 1
+    disruption_prone:
+      share: 0.06
+      po_weight: 0.9
+      on_time_p: [0.80, 0.70]
+      mean_late_days: [7, 7]
+      defect_mean: [0.03, 0.03]
+      invoice_variance_p: 0.08
+      invoice_variance_magnitude: 0.02
+      demand_capacity_ratio: 0.80
+      cert_expiry_p: 0.05
+      risk_signals_per_year: 6
+    sparse_history:
+      share: 0.05
+      po_weight: 0.1
+      on_time_p: [0.85, 0.85]
+      mean_late_days: [4, 4]
+      defect_mean: [0.02, 0.02]
+      invoice_variance_p: 0.08
+      invoice_variance_magnitude: 0.02
+      demand_capacity_ratio: 0.60
+      cert_expiry_p: 0.10
+      risk_signals_per_year: 0.2
+    recovering:
+      share: 0.05
+      po_weight: 1.0
+      on_time_p: [0.60, 0.93]
+      mean_late_days: [6, 2]
+      defect_mean: [0.06, 0.015]
+      invoice_variance_p: 0.08
+      invoice_variance_magnitude: 0.02
+      demand_capacity_ratio: 0.85
+      cert_expiry_p: 0.05
+      risk_signals_per_year: 1
+
+anomalies:
+  e_cross_supplier_fraction: 0.6
+  full:
+    positives_per_class: 25
+    negatives: {shipments: 500, delivery_event_pairs: 500, risk_signals: 300, scores: 300}
+  starter:
+    positives_per_class: 5
+    negatives: {shipments: 40, delivery_event_pairs: 40, risk_signals: 30, scores: 30}
