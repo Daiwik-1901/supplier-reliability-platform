@@ -10,6 +10,11 @@ CONFIG_PATH = Path(__file__).resolve().parents[1] / "config" / "default.yaml"
 
 
 @pytest.fixture(scope="session")
+def config_path() -> Path:
+    return CONFIG_PATH
+
+
+@pytest.fixture(scope="session")
 def app_config() -> AppConfig:
     return load_app_config(CONFIG_PATH)
 

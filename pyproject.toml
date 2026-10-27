@@ -38,6 +38,7 @@ packages = ["src/supplier_reliability"]
 [tool.ruff]
 line-length = 100
 target-version = "py312"
+extend-exclude = ["docs"]
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "UP", "B", "SIM"]
@@ -45,4 +46,8 @@ select = ["E", "F", "I", "UP", "B", "SIM"]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 addopts = "-m 'not slow'"
+filterwarnings = [
+    # Third party: fastapi.testclient re-exports starlette TestClient, which warns that it prefers httpx2 (not yet adopted by FastAPI).
+    "ignore:Using .httpx. with .starlette.testclient. is deprecated:starlette.exceptions.StarletteDeprecationWarning",
+]
 markers = ["slow: full-scale tests excluded by default (run with -m slow)"]

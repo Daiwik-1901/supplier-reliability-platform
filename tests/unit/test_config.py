@@ -1,13 +1,12 @@
 import copy
 import json
-from pathlib import Path
+import os
 
 import pytest
 from pydantic import ValidationError
 
+from supplier_reliability import SCORING_VERSION
 from supplier_reliability.config import AppConfig, Settings, load_app_config
-
-CONFIG_PATH = Path(__file__).resolve().parents[2] / "config" / "default.yaml"
 
 
 def _data(app_config: AppConfig) -> dict:
@@ -22,7 +21,8 @@ def test_default_weights_sum_to_one(app_config):
 def test_negative_weight_rejected(app_config):
     data = _data(app_config)
     data["scoring"]["weights"]["cost"] = -0.15
-    with pytest.raises(ValidationError):
+    data["scoring"]["weights"]["delivery"] = 0.60  # still sums to 1
+    with pytest.raises(ValidationError, match="nonnegative"):
         AppConfig.model_validate(data)
 
 
@@ -55,8 +55,8 @@ def test_profile_shares_must_sum_to_one(app_config):
         AppConfig.model_validate(data)
 
 
-def test_config_hash_stable(app_config):
-    assert app_config.config_hash() == load_app_config(CONFIG_PATH).config_hash()
+def test_config_hash_stable(app_config, config_path):
+    assert app_config.config_hash() == load_app_config(config_path).config_hash()
 
 
 def test_config_hash_changes_with_parameters(app_config):
@@ -78,9 +78,11 @@ def test_default_yaml_carries_required_parameters(app_config):
 
 
 def test_settings_defaults_and_env_prefix(monkeypatch):
+    for key in [k for k in os.environ if k.startswith("SRP_")]:
+        monkeypatch.delenv(key)
     monkeypatch.setenv("SRP_MAX_PAGE_SIZE", "42")
     monkeypatch.setenv("SRP_CORS_ORIGINS", '["http://a.example"]')
-    settings = Settings()
+    settings = Settings(_env_file=None)
     assert settings.max_page_size == 42
     assert settings.cors_origins == ["http://a.example"]
     assert settings.app_env == "local"
@@ -89,3 +91,30 @@ def test_settings_defaults_and_env_prefix(monkeypatch):
 def test_canonical_json_has_no_whitespace(app_config):
     assert " " not in app_config.canonical_json()
     assert json.loads(app_config.canonical_json())["scoring"]["grace_hours"] == 24
+
+
+@pytest.mark.parametrize(
+    ("field", "key"),
+    [
+        ("category_thresholds", "AT_RISK"),
+        ("min_observations", "cost"),
+        ("compliance_points", "EXPIRED"),
+        ("severity_weights", "CRITICAL"),
+    ],
+)
+def test_missing_map_key_rejected(app_config, field, key):
+    data = _data(app_config)
+    del data["scoring"][field][key]
+    with pytest.raises(ValidationError, match="exactly"):
+        AppConfig.model_validate(data)
+
+
+def test_profile_without_share_is_validation_error(app_config):
+    data = _data(app_config)
+    del data["generator"]["profiles"]["average"]["share"]
+    with pytest.raises(ValidationError, match="share"):
+        AppConfig.model_validate(data)
+
+
+def test_scoring_version_matches_package_constant(app_config):
+    assert app_config.scoring.scoring_version == SCORING_VERSION

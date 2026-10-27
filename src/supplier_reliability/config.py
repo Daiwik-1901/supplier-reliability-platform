@@ -87,6 +87,19 @@ class ScoringConfig(_Strict):
         return self
 
     @model_validator(mode="after")
+    def _check_key_sets(self) -> "ScoringConfig":
+        expected = {
+            "category_thresholds": {"HIGH", "ACCEPTABLE", "AT_RISK", "CRITICAL"},
+            "min_observations": {"delivery", "quality", "cost"},
+            "compliance_points": {"COMPLIANT", "PENDING_VERIFICATION", "EXPIRED", "NONCOMPLIANT"},
+            "severity_weights": {"NONE", "LOW", "MEDIUM", "HIGH", "CRITICAL"},
+        }
+        for name, keys in expected.items():
+            if set(getattr(self, name)) != keys:
+                raise ValueError(f"{name} must define exactly {sorted(keys)}")
+        return self
+
+    @model_validator(mode="after")
     def _check_thresholds(self) -> "ScoringConfig":
         bands = sorted(self.category_thresholds.values(), key=lambda b: b.lower)
         if not bands or bands[0].lower != 0 or bands[-1].upper != 100:
@@ -110,6 +123,8 @@ class GeneratorSettingsBlock(_Strict):
 
     @model_validator(mode="after")
     def _check_profile_shares(self) -> "GeneratorSettingsBlock":
+        if any("share" not in p for p in self.profiles.values()):
+            raise ValueError("every profile must define 'share'")
         total = sum(p["share"] for p in self.profiles.values())
         if abs(total - 1.0) > TOLERANCE:
             raise ValueError(f"profile shares must sum to 1, got {total}")
