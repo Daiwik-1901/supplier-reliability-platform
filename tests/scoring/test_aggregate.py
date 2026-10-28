@@ -19,11 +19,21 @@ from supplier_reliability.domain.enums import (
     Severity,
 )
 from supplier_reliability.services.scoring.aggregate import aggregate, categorize
-from supplier_reliability.services.scoring.components import ComponentResult
-from supplier_reliability.services.scoring.engine import ScoreResult, score_supplier
+from supplier_reliability.services.scoring.components import (
+    COMPONENT_EXCLUSION_REASONS,
+    ComponentResult,
+)
+from supplier_reliability.services.scoring.engine import (
+    _ENTITY_BY_REASON,
+    ScoreResult,
+    _entity_for_reason,
+    _observations,
+    score_supplier,
+)
 from supplier_reliability.services.scoring.evidence import DeliveryObs, ExcludedRecord
 
 from .builders import (
+    FEB,
     JAN,
     bundle,
     cap,
@@ -398,3 +408,109 @@ def test_fingerprint_covers_all_ids_even_when_explanation_is_truncated(cfg):
     ids_b = b.explanation["components"]["delivery"]["source_record_ids"]
     assert ids_a == ids_b  # the changed id is beyond the 200 shown ids
     assert a.evidence_fingerprint != b.evidence_fingerprint
+
+
+def test_precedence_insufficient_plus_compliance_failure_plus_exception(cfg):
+    r = aggregate(
+        comps(None, None, None, None, None, "50", mandatory_compliance_failure=True),
+        cfg,
+        ["EXC-000001"],
+    )
+    assert r.category == ReliabilityCategory.INSUFFICIENT_EVIDENCE
+    assert r.decision == Decision.SUSPEND_PENDING_REVIEW
+    assert r.applied_overrides == ["mandatory_compliance_failure"]
+
+
+# --- R24: fingerprint set == lineage set, no silent drops -------------------------------------
+
+
+def _kind_ids(b) -> dict[str, set[str]]:
+    return {
+        "delivery": {d.shipment_id for d in b.deliveries},
+        "quality": {i.inspection_id for i in b.inspections},
+        "cost": {i.invoice_id for i in b.invoices},
+        "capacity": {d.po_line_id for d in b.demand}
+        | {c.capacity_declaration_id for c in b.capacities},
+        "compliance": {c.requirement_id for c in b.compliance},
+        "disruption": {r.risk_signal_id for r in b.risks},
+    }
+
+
+R24_BUNDLES = {
+    "full": lambda: full_bundle(),
+    "missing_delivery": lambda: full_bundle(deliveries=deliveries(on_time=4)),
+    "capacity_no_demand_month": lambda: full_bundle(
+        capacities=[cap(JAN, 100, cid="CAP-1"), cap(FEB, 100, cid="CAP-2")]
+    ),
+    "capacity_partly_used_declaration": lambda: full_bundle(
+        demand=[demand(JAN, 50)],
+        capacities=[cap(JAN, 100, cid="CAP-1"), cap(FEB, 100, cid="CAP-1")],
+    ),
+    "capacity_no_demand_at_all": lambda: full_bundle(demand=[]),
+    "capacity_unverified_and_zero_demand": lambda: full_bundle(
+        demand=[demand(JAN, 50), demand(JAN, 0, line="POL-0")],
+        capacities=[cap(JAN, 100), cap(JAN, 100, verified=False, cid="CAP-U")],
+    ),
+    "capacity_demand_without_capacity_month": lambda: full_bundle(
+        demand=[demand(JAN, 50), demand(FEB, 50, line="POL-2")]
+    ),
+    "capacity_unknown": lambda: full_bundle(capacities=[]),
+    "zero_expected_invoice": lambda: full_bundle(
+        invoices=invoices(("100", "100"), ("100", "100"), ("100", "100"), ("0", "5"))
+    ),
+    "too_few_invoices": lambda: full_bundle(invoices=invoices(("100", "100"))),
+    "too_few_inspections": lambda: full_bundle(inspections=inspections((100, 0))),
+    "zero_inspected_units": lambda: full_bundle(inspections=inspections((0, 0), (0, 0), (0, 0))),
+    "unknown_compliance": lambda: full_bundle(
+        compliance=[comp(ComplianceState.UNKNOWN), comp(ComplianceState.COMPLIANT, rid="REQ-2")]
+    ),
+    "all_unknown_compliance": lambda: full_bundle(compliance=[comp(ComplianceState.UNKNOWN)]),
+    "deduplicated_risks": lambda: full_bundle(
+        risks=[
+            risk("RSK-1", Severity.HIGH, key="k"),
+            risk("RSK-2", Severity.LOW, key="k"),
+            risk("RSK-3", Severity.MEDIUM),
+        ]
+    ),
+    "empty": lambda: bundle(),
+}
+
+
+@pytest.mark.parametrize("name", sorted(R24_BUNDLES))
+def test_fingerprint_set_equals_lineage_set_and_nothing_is_dropped(cfg, name):
+    b = R24_BUNDLES[name]()
+    s = score_supplier(b, cfg, "h")
+    included = {n: set(r.source_record_ids) for n, r in s.components.items()}
+    excluded = {n: {i for i, _ in r.excluded_record_ids} for n, r in s.components.items()}
+    fp_ids = {o["record_id"] for o in _observations(b, s.components)}
+    assert fp_ids == set().union(*included.values())
+    for component, ids in _kind_ids(b).items():
+        assert ids == included[component] | excluded[component], component
+
+
+def test_missing_delivery_still_lists_all_evaluated_records(cfg):
+    r = score_supplier(full_bundle(deliveries=deliveries(on_time=4)), cfg, "h").components
+    assert r["delivery"].score is None and len(r["delivery"].source_record_ids) == 4
+
+
+def test_verified_declaration_for_month_without_demand_is_excluded_with_reason(cfg):
+    b = R24_BUNDLES["capacity_no_demand_month"]()
+    r = score_supplier(b, cfg, "h").components["capacity"]
+    assert ("CAP-2", "no_demand_in_month") in r.excluded_record_ids
+    assert "CAP-2" not in r.source_record_ids
+
+
+def test_every_component_exclusion_reason_has_an_entity_type():
+    assert set(_ENTITY_BY_REASON) == set(COMPONENT_EXCLUSION_REASONS)
+    for reason in COMPONENT_EXCLUSION_REASONS:
+        assert _entity_for_reason(reason)
+    with pytest.raises(ValueError, match="made_up_reason"):
+        _entity_for_reason("made_up_reason")
+
+
+def test_all_reasons_seen_in_scenarios_are_known(cfg):
+    seen = set()
+    for make in R24_BUNDLES.values():
+        for r in score_supplier(make(), cfg, "h").components.values():
+            seen |= {reason for _, reason in r.excluded_record_ids}
+    assert seen <= set(COMPONENT_EXCLUSION_REASONS)

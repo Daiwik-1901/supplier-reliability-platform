@@ -11,11 +11,12 @@ the cut-off amounts are reported as `truncated_count` / `excluded_records_trunca
 fingerprint always covers every included observation.
 
 Evidence fingerprint (R23): sha256 hex of canonical JSON (sorted keys, separators (",", ":")) of
-{"scoring_version", "config_hash", "observations"}. Observations are the INCLUDED evidence items of
-all components (those a component would not exclude, whether or not the component reached its
-minimum observation count), each a dict {component, record_id, <values the component used>} with
-Decimals/dates as strings, sorted by (component, record_id, canonical JSON). Excluded records are
-not part of it, so evidence that is ignored can never change a score's identity.
+{"scoring_version", "config_hash", "observations"}. Observations are exactly the lineage set
+(R24): the items in the components' `source_record_ids` (every record a component evaluated,
+whether or not it reached its minimum observation count; deliberately unused records are listed
+in `excluded_record_ids` with a reason instead). Each is a dict {component, record_id, <values
+the component used>} with Decimals/dates as strings, sorted by (component, record_id, canonical
+JSON). Excluded records are not part of it, so evidence that is ignored can never change a score's identity.
 """
 
 import hashlib
@@ -56,15 +57,24 @@ _SCORERS = (
     (ComponentName.compliance, score_compliance),
     (ComponentName.disruption, score_disruption),
 )
-# entity type of component-level exclusions (`ComponentResult.excluded_record_ids`), by reason
+# entity type of component-level exclusions (`ComponentResult.excluded_record_ids`), by reason;
+# must cover components.COMPONENT_EXCLUSION_REASONS (tested)
 _ENTITY_BY_REASON = {
     "zero_expected": "invoice",
     "capacity_unverified": "capacity_declaration",
     "zero_quantity_demand": "po_line",
     "no_verified_capacity_for_month": "po_line",
+    "no_demand_in_month": "capacity_declaration",
     "state_unknown": "compliance_requirement",
     "deduplicated": "risk_signal",
 }
+
+
+def _entity_for_reason(reason: str) -> str:
+    try:
+        return _ENTITY_BY_REASON[reason]
+    except KeyError:
+        raise ValueError(f"unmapped component exclusion reason: {reason!r}") from None
 
 
 @dataclass(frozen=True)
@@ -212,7 +222,7 @@ def _excluded(
         rows[e.component.value].add((e.source_entity_type, e.source_record_id, e.reason, month))
     for name, r in results.items():
         for record_id, reason in r.excluded_record_ids:
-            entity = _ENTITY_BY_REASON.get(reason, "record")
+            entity = _entity_for_reason(reason)
             rows[name].add((entity, record_id, reason, ""))
     out: dict[str, list[dict[str, Any]]] = {}
     truncated: dict[str, int] = {}
@@ -230,31 +240,37 @@ def _excluded(
 
 
 def _observations(bundle: EvidenceBundle, results: dict[str, ComponentResult]) -> list[dict]:
-    def skip(name: ComponentName) -> set[str]:
-        return {rid for rid, _ in results[name.value].excluded_record_ids}
-
+    """Exactly the lineage set (R24): one item per record in a component's `source_record_ids`,
+    with the values the component used. Nothing is added beyond the components' included ids."""
     obs: list[dict[str, Any]] = []
 
     def add(component: ComponentName, record_id: str, **values: Any) -> None:
         obs.append(_plain({"component": component.value, "record_id": record_id, **values}))
 
+    def included(name: ComponentName) -> set[str]:
+        return set(results[name.value].source_record_ids)
+
+    ids = included(ComponentName.delivery)
     for d in bundle.deliveries:
-        add(ComponentName.delivery, d.shipment_id, expected=d.expected, arrived=d.arrived_known)
+        if d.shipment_id in ids:
+            add(ComponentName.delivery, d.shipment_id, expected=d.expected, arrived=d.arrived_known)
+    ids = included(ComponentName.quality)
     for i in bundle.inspections:
-        add(
-            ComponentName.quality,
-            i.inspection_id,
-            shipment_line_id=i.shipment_line_id,
-            inspected=i.inspected,
-            defect=i.defect,
-        )
-    excluded = skip(ComponentName.cost)
+        if i.inspection_id in ids:
+            add(
+                ComponentName.quality,
+                i.inspection_id,
+                shipment_line_id=i.shipment_line_id,
+                inspected=i.inspected,
+                defect=i.defect,
+            )
+    ids = included(ComponentName.cost)
     for inv in bundle.invoices:
-        if inv.invoice_id not in excluded:
+        if inv.invoice_id in ids:
             add(ComponentName.cost, inv.invoice_id, expected=inv.expected, invoiced=inv.invoiced)
-    excluded = skip(ComponentName.capacity)
+    ids = included(ComponentName.capacity)
     for line in bundle.demand:
-        if line.po_line_id not in excluded:
+        if line.po_line_id in ids:
             add(
                 ComponentName.capacity,
                 line.po_line_id,
@@ -264,7 +280,7 @@ def _observations(bundle: EvidenceBundle, results: dict[str, ComponentResult]) -
                 unit_of_measure=line.unit_of_measure,
             )
     for c in bundle.capacities:
-        if c.capacity_declaration_id not in excluded:
+        if c.capacity_declaration_id in ids:
             add(
                 ComponentName.capacity,
                 c.capacity_declaration_id,
@@ -275,9 +291,9 @@ def _observations(bundle: EvidenceBundle, results: dict[str, ComponentResult]) -
                 committed=c.committed,
                 verified=c.verified,
             )
-    excluded = skip(ComponentName.compliance)
+    ids = included(ComponentName.compliance)
     for r in bundle.compliance:
-        if r.requirement_id not in excluded:
+        if r.requirement_id in ids:
             add(
                 ComponentName.compliance,
                 r.requirement_id,
@@ -287,9 +303,9 @@ def _observations(bundle: EvidenceBundle, results: dict[str, ComponentResult]) -
                 valid_from=r.valid_from,
                 valid_to=r.valid_to,
             )
-    excluded = skip(ComponentName.disruption)
+    ids = included(ComponentName.disruption)
     for s in bundle.risks:
-        if s.risk_signal_id not in excluded:
+        if s.risk_signal_id in ids:
             add(
                 ComponentName.disruption,
                 s.risk_signal_id,

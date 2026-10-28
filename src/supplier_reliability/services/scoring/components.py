@@ -42,6 +42,18 @@ _COVERAGE_QUANTUM = Decimal("0.0001")
 # changing it must never change scores and must not require a scoring_version bump.
 _MAX_EARLY_ARRIVAL = timedelta(days=365)
 INFINITE_UTILISATION = "inf"
+# Every reason a component puts in `excluded_record_ids` (the engine maps each to an entity type).
+COMPONENT_EXCLUSION_REASONS = frozenset(
+    {
+        "zero_expected",
+        "capacity_unverified",
+        "zero_quantity_demand",
+        "no_verified_capacity_for_month",
+        "no_demand_in_month",
+        "state_unknown",
+        "deduplicated",
+    }
+)
 
 
 class InvalidEvidenceError(ValueError):
@@ -98,7 +110,10 @@ def _missing(
     metrics: dict[str, Any] | None = None,
     excluded: list[tuple[str, str]] | None = None,
     flags: dict[str, bool] | None = None,
+    sources: list[str] | None = None,
 ) -> ComponentResult:
+    """A missing result. `sources` are the records the component evaluated (R24): included
+    lineage even though too few of them exist to produce a score."""
     return ComponentResult(
         name=name,
         score=None,
@@ -108,7 +123,7 @@ def _missing(
         coverage=coverage.quantize(_COVERAGE_QUANTUM),
         metrics=metrics or {},
         missing_reason=reason,
-        source_record_ids=[],
+        source_record_ids=sorted(sources or []),
         flags=flags or {},
         excluded_record_ids=sorted(excluded or []),
     )
@@ -150,6 +165,7 @@ def score_delivery(ev: EvidenceBundle, cfg: ScoringConfig) -> ComponentResult:
             observations=n,
             coverage=coverage,
             metrics={"eligible_count": n, "known_outcomes": known, "coverage": _s(coverage)},
+            sources=[d.shipment_id for d in ev.deliveries],
         )
 
     count = Decimal(n)
@@ -197,10 +213,20 @@ def score_quality(ev: EvidenceBundle, cfg: ScoringConfig) -> ComponentResult:
     n = len(ev.inspections)
     minimum = cfg.min_observations["quality"]
     if n < minimum:
-        return _missing(name, f"insufficient inspections: {n} < {minimum}", observations=n)
+        return _missing(
+            name,
+            f"insufficient inspections: {n} < {minimum}",
+            observations=n,
+            sources=[i.inspection_id for i in ev.inspections],
+        )
     inspected = sum((i.inspected for i in ev.inspections), ZERO)
     if inspected == 0:
-        return _missing(name, "no inspected units", observations=n)
+        return _missing(
+            name,
+            "no inspected units",
+            observations=n,
+            sources=[i.inspection_id for i in ev.inspections],
+        )
     defects = sum((i.defect for i in ev.inspections), ZERO)
     rate = defects / inspected
     score = HUNDRED * max(ZERO, ONE - rate / _d(cfg.defect_rate_zero_score))
@@ -246,6 +272,7 @@ def score_cost(ev: EvidenceBundle, cfg: ScoringConfig) -> ComponentResult:
             coverage=coverage,
             metrics=base_metrics,
             excluded=excluded,
+            sources=[i.invoice_id for i in usable],
         )
     under = _d(cfg.underbilling_weight)
     numerator = sum(
@@ -307,11 +334,13 @@ def score_capacity(ev: EvidenceBundle, cfg: ScoringConfig) -> ComponentResult:
         }
         | {(d.po_line_id, "zero_quantity_demand") for d in ev.demand if d.quantity == 0}
     )
+    evaluated_lines = sorted({d.po_line_id for d in ev.demand if d.quantity > 0})
     if not ev.capacities:
-        return _missing(name, "capacity unknown", excluded=unverified)
+        return _missing(name, "capacity unknown", excluded=unverified, sources=evaluated_lines)
     verified = [c for c in ev.capacities if c.verified]
     if not verified:
-        return _missing(name, "capacity unverified", excluded=unverified)
+        return _missing(name, "capacity unverified", excluded=unverified, sources=evaluated_lines)
+    verified_ids = {c.capacity_declaration_id for c in verified}
 
     required: dict[date, Decimal] = defaultdict(lambda: ZERO)
     lines: dict[date, list[str]] = defaultdict(list)
@@ -320,7 +349,8 @@ def score_capacity(ev: EvidenceBundle, cfg: ScoringConfig) -> ComponentResult:
             required[d.month] += d.quantity
             lines[d.month].append(d.po_line_id)
     if not required:
-        return _missing(name, "no demand in window", excluded=unverified)
+        unused = [(cid, "no_demand_in_month") for cid in verified_ids]
+        return _missing(name, "no demand in window", excluded=unverified + unused)
 
     free: dict[date, Decimal] = defaultdict(lambda: ZERO)
     declarations: dict[date, set[str]] = defaultdict(set)
@@ -330,9 +360,12 @@ def score_capacity(ev: EvidenceBundle, cfg: ScoringConfig) -> ComponentResult:
 
     months = sorted(m for m in required if m in free)
     skipped = sorted(m for m in required if m not in free)
-    excluded = list(unverified) + [
-        (line, "no_verified_capacity_for_month") for m in skipped for line in lines[m]
-    ]
+    used_declarations = {cid for m in months for cid in declarations[m]}
+    excluded = (
+        list(unverified)
+        + [(line, "no_verified_capacity_for_month") for m in skipped for line in lines[m]]
+        + [(cid, "no_demand_in_month") for cid in verified_ids - used_declarations]
+    )
     coverage = _coverage(len(months), len(required))
     if not months:
         return _missing(
@@ -354,9 +387,7 @@ def score_capacity(ev: EvidenceBundle, cfg: ScoringConfig) -> ComponentResult:
     monthly = {
         m.isoformat(): _s(finite[m]) if m in finite else INFINITE_UTILISATION for m in months
     }
-    sources = {line for m in months for line in lines[m]} | {
-        cid for m in months for cid in declarations[m]
-    }
+    sources = {line for m in months for line in lines[m]} | used_declarations
     return ComponentResult(
         name=name,
         score=_clamp_round(score),
@@ -411,6 +442,7 @@ def score_compliance(ev: EvidenceBundle, cfg: ScoringConfig) -> ComponentResult:
             coverage=coverage,
             metrics=metrics,
             flags=flags,
+            excluded=[(c.requirement_id, "state_unknown") for c in ev.compliance],
         )
     points = sum((_d(cfg.compliance_points[c.state.value]) for c in known), ZERO)
     return ComponentResult(

@@ -33,12 +33,10 @@ from supplier_reliability.services.scoring.evidence import (
     InvoiceObs,
 )
 
-from .builders import (  # noqa: F401
-    CUTOFF,
+from .builders import (
     FEB,
     JAN,
     START,
-    WINDOW,
     D,
     assert_missing,
     bundle,
@@ -631,4 +629,7 @@ def test_capacity_zero_quantity_demand_is_reported_not_dropped(cfg):
         bundle(demand=[demand(JAN, 0, "POL-0")], capacities=[cap(JAN, 100)]), cfg
     )
     assert_missing(only_zero, "no demand in window")
-    assert only_zero.excluded_record_ids == [("POL-0", "zero_quantity_demand")]
+    assert only_zero.excluded_record_ids == [
+        ("CAP-1", "no_demand_in_month"),  # R24: the declaration is accounted for too
+        ("POL-0", "zero_quantity_demand"),
+    ]
