@@ -30,16 +30,22 @@ from supplier_reliability.domain.enums import (
     ComponentName,
     Decision,
     DeliveryEventType,
+    DetectionStatus,
+    Disposition,
+    IssueType,
     Region,
     ReliabilityCategory,
+    Severity,
     ShipmentStatus,
     SupplierCategory,
     SupplierStatus,
 )
 from supplier_reliability.models import (
+    DataException,
     DeliveryEvent,
     Invoice,
     PurchaseOrder,
+    RawIngestionRecord,
     ScoreEvidence,
     ScoringConfigSnapshot,
     Shipment,
@@ -56,7 +62,7 @@ from supplier_reliability.repositories.scores import (
 from supplier_reliability.services.generator.config import GeneratorConfig
 from supplier_reliability.services.generator.dataset import generate_dataset
 from supplier_reliability.services.generator.loader import load_dataset
-from supplier_reliability.services.scoring.evidence import EvaluationWindow, quarter_windows
+from supplier_reliability.services.scoring.evidence import EvaluationWindow, scorecard_windows
 from supplier_reliability.services.scoring.service import (
     CalculationRequest,
     ScoringService,
@@ -65,10 +71,10 @@ from supplier_reliability.services.scoring.service import (
     scoring_config_hash,
 )
 
-WINDOWS = quarter_windows(
-    datetime(2025, 1, 1, tzinfo=UTC), datetime(2026, 6, 30, 23, 59, 59, tzinfo=UTC)
+WINDOWS = scorecard_windows(
+    datetime(2025, 1, 1, tzinfo=UTC), datetime(2026, 6, 30, 23, 59, 59, tzinfo=UTC), 12
 )
-Q3_2025 = WINDOWS[2]
+Q3_2025 = WINDOWS[2]  # trailing 12 months (clipped to 2025-01-01) ending 2025-09-30
 NOW = datetime(2026, 10, 1, 12, 0, tzinfo=UTC)
 COMPONENTS = [c.value for c in ComponentName]
 SCORE_COLUMNS = {c: f"{c}_score" for c in COMPONENTS}
@@ -184,6 +190,35 @@ def overdue_shipment(session: Session, window: EvaluationWindow) -> tuple[str, s
         if shipment_id not in known and shipment_id not in corrected:
             return supplier_id, shipment_id, expected
     raise AssertionError("starter data has no overdue shipment in the window")
+
+
+def backdate_arrival(session: Session, window: EvaluationWindow) -> str:
+    """Insert, for the first due shipment with an ARRIVED known at C, an earlier-recorded
+    ARRIVED one day earlier (it becomes the first-recorded arrival); returns the supplier id."""
+    c = window.cutoff
+    row = session.execute(
+        sa.select(DeliveryEvent, PurchaseOrder.supplier_id)
+        .join(Shipment, Shipment.shipment_id == DeliveryEvent.shipment_id)
+        .join(PurchaseOrder, PurchaseOrder.po_id == Shipment.po_id)
+        .where(
+            Shipment.expected_delivery_timestamp.between(window.start, window.occurrence_end),
+            Shipment.created_at <= c,
+            Shipment.shipment_status != ShipmentStatus.CANCELLED,
+            DeliveryEvent.event_type == DeliveryEventType.ARRIVED,
+            DeliveryEvent.event_timestamp <= c,
+            DeliveryEvent.recorded_timestamp <= c,
+        )
+        .order_by(DeliveryEvent.delivery_event_id)
+    ).first()
+    assert row is not None
+    event, supplier_id = row
+    add_arrival(
+        session,
+        event.shipment_id,
+        event.event_timestamp - timedelta(days=1),
+        event.recorded_timestamp - timedelta(days=1),
+    )
+    return supplier_id
 
 
 def add_arrival(session: Session, shipment_id: str, at: datetime, recorded: datetime) -> str:
@@ -431,14 +466,13 @@ def test_late_arriving_event_does_not_change_historical_score(session, cfg):
 # --- restatement ------------------------------------------------------------------------------
 
 
-def _included(session: Session, score_id: str) -> set[str]:
-    return set(
-        session.scalars(
-            sa.select(ScoreEvidence.source_record_id).where(
-                ScoreEvidence.score_id == score_id, ScoreEvidence.included.is_(True)
-            )
-        )
+def _included(session: Session, score_id: str, component: str | None = None) -> set[str]:
+    stmt = sa.select(ScoreEvidence.source_record_id).where(
+        ScoreEvidence.score_id == score_id, ScoreEvidence.included.is_(True)
     )
+    if component is not None:
+        stmt = stmt.where(ScoreEvidence.component == component)
+    return set(session.scalars(stmt))
 
 
 def test_restatement_with_later_cutoff_links_and_reports_differences(session, cfg):
@@ -468,10 +502,15 @@ def test_restatement_with_later_cutoff_links_and_reports_differences(session, cf
             any_difference |= entry["from"] != entry["to"]
         a, b = old.overall_score, new.overall_score
         assert diff["overall"]["delta"] == (None if a is None or b is None else str(b - a))
-        old_ids, new_ids = _included(session, old.score_id), _included(session, new.score_id)
-        assert diff["evidence_added"] == sorted(new_ids - old_ids)
-        assert diff["evidence_removed"] == sorted(old_ids - new_ids)
-        any_difference |= bool(diff["evidence_added"] or diff["evidence_removed"])
+        assert set(diff["evidence"]) == set(COMPONENTS)
+        for name in COMPONENTS:
+            old_ids = _included(session, old.score_id, name)
+            new_ids = _included(session, new.score_id, name)
+            assert diff["evidence"][name] == {
+                "added": sorted(new_ids - old_ids),
+                "removed": sorted(old_ids - new_ids),
+            }
+            any_difference |= bool(new_ids ^ old_ids)
     assert any_difference  # 45 more days of knowledge changes something in the starter data
     again = service(session, cfg).restate(later, None, "late knowledge")
     assert again.created == [] and sorted(again.existing) == sorted(outcome.created)
@@ -590,11 +629,15 @@ def test_lineage_counts_match_explanation_observations(scored):
     evidence = _evidence_by_score(scored)
     checked = 0
     for score in scored.scalars(sa.select(SupplierScore)):
-        counts = Counter(e.component for e in evidence[score.score_id] if e.included)
+        rows = [e for e in evidence[score.score_id] if e.included]
+        counts = Counter(e.component for e in rows)
         for name in COMPONENTS:
             listed = score.explanation["components"][name]
             assert counts[name] == len(listed["source_record_ids"]) + listed["truncated_count"]
-            if name != "capacity":
+            if name == "delivery":  # delivery events are lineage too; observations = shipments
+                shipments = [e for e in rows if e.source_entity_type == "shipment"]
+                assert len(shipments) == listed["observations"], score.score_id
+            elif name != "capacity":
                 assert counts[name] == listed["observations"], (score.score_id, name)
             checked += 1
     assert checked == 300 * 6
@@ -704,14 +747,20 @@ def test_list_scores_filters_pagination_and_sort(scored):
     assert all(r.reliability_category == ReliabilityCategory.INSUFFICIENT_EVIDENCE
                for r in insufficient)  # fmt: skip
 
-    q3, n = list_scores(
+    # trailing windows: those starting at/after 2025-01-01 and ending by 2025-09-30 are the
+    # three scorecards ending 2025Q1..2025Q3
+    upto_q3, n = list_scores(
         scored,
         ScoreFilters(evaluation_start=Q3_2025.start, evaluation_end=Q3_2025.end),
         500,
         0,
         "score_id",
     )
-    assert n == 50 and {r.evaluation_end for r in q3} == {Q3_2025.end}
+    assert n == 150 and {r.evaluation_end for r in upto_q3} == {w.end for w in WINDOWS[:3]}
+    last, n = list_scores(
+        scored, ScoreFilters(evaluation_start=WINDOWS[5].start), 500, 0, "score_id"
+    )
+    assert n == 50 and {r.evaluation_end for r in last} == {WINDOWS[5].end}
 
     with pytest.raises(ValueError, match="sort"):
         list_scores(scored, ScoreFilters(), 10, 0, "explanation")
@@ -730,3 +779,156 @@ def test_list_scores_current_only_default(starter, cfg):
         session, ScoreFilters(supplier_id=supplier_id, current_only=False), 10, 0, "score_id"
     )
     assert n == 2 and [r.version_number for r in history] == [1, 2]
+
+
+# --- fix round 1 --------------------------------------------------------------------------------
+
+
+def test_rebuild_of_superseded_version_ignores_later_backdated_arrival(starter, cfg):
+    _, session = starter
+    window = WINDOWS[5]
+    service(session, cfg).calculate(CalculationRequest(window, None, None))
+    supplier_id, shipment_id, expected = overdue_shipment(session, window)
+    add_arrival(session, shipment_id, expected - timedelta(hours=2), expected - timedelta(hours=1))
+    outcome = service(session, cfg).recalculate(
+        CalculationRequest(window, [supplier_id], None), "x"
+    )
+    (old_id,) = outcome.superseded
+    old = session.get(SupplierScore, old_id)
+    rebuilt = rebuild_from_lineage(session, old_id)
+    for name in COMPONENTS:
+        assert rebuilt.components[name].score == getattr(old, SCORE_COLUMNS[name])
+    assert rebuilt.overall.overall == old.overall_score
+    assert rebuilt.evidence_fingerprint == old.evidence_fingerprint
+    new_id = outcome.superseded[old_id]
+    assert rebuild_from_lineage(session, new_id).evidence_fingerprint == (
+        session.get(SupplierScore, new_id).evidence_fingerprint
+    )
+
+
+def _drop_one_lineage_row(session: Session, entity: str) -> str:
+    """Delete one included delivery row of `entity` (from a score whose delivery is scored);
+    returns the score id."""
+    row = session.scalars(
+        sa.select(ScoreEvidence)
+        .join(SupplierScore, SupplierScore.score_id == ScoreEvidence.score_id)
+        .where(
+            ScoreEvidence.component == ComponentName.delivery,
+            ScoreEvidence.source_entity_type == entity,
+            ScoreEvidence.included.is_(True),
+            SupplierScore.delivery_score.is_not(None),
+        )
+        .order_by(ScoreEvidence.score_id, ScoreEvidence.source_record_id)
+    ).first()
+    assert row is not None, entity
+    score_id = row.score_id
+    session.delete(row)
+    session.commit()
+    return score_id
+
+
+@pytest.mark.parametrize("entity", ["shipment", "delivery_event"])
+def test_rebuild_depends_on_delivery_lineage_rows(scored, entity):
+    score_id = _drop_one_lineage_row(scored, entity)
+    stored = scored.get(SupplierScore, score_id)
+    rebuilt = rebuild_from_lineage(scored, score_id)
+    assert rebuilt.evidence_fingerprint != stored.evidence_fingerprint
+
+
+def test_recalculate_of_restatement_keeps_link_and_recomputes_differences(session, cfg):
+    service(session, cfg).calculate(CalculationRequest(Q3_2025, None, None))
+    later = EvaluationWindow(Q3_2025.start, Q3_2025.end, Q3_2025.cutoff + timedelta(days=45))
+    service(session, cfg).restate(later, None, "late knowledge")
+    supplier_id = backdate_arrival(session, later)
+    v1 = next(r for r in scores_of(session, later) if r.supplier_id == supplier_id)
+    outcome = service(session, cfg).recalculate(
+        CalculationRequest(later, [supplier_id], None), "repair"
+    )
+    v2 = session.get(SupplierScore, outcome.superseded[v1.score_id])
+    assert v2.version_number == 2
+    assert v1.restates_score_id is not None and v2.restates_score_id == v1.restates_score_id
+    diff = v2.explanation["differences_from_restated"]
+    restated = session.get(SupplierScore, v1.restates_score_id)
+    assert diff["restated_score_id"] == restated.score_id
+    for name in COMPONENTS:
+        b = getattr(v2, SCORE_COLUMNS[name])
+        assert diff[name]["to"] == (None if b is None else str(b))
+    assert diff["evidence"]["delivery"]["added"] == sorted(
+        _included(session, v2.score_id, "delivery")
+        - _included(session, restated.score_id, "delivery")
+    )
+    assert diff != v1.explanation["differences_from_restated"]
+
+
+def _open_critical_exception(session: Session, supplier_id: str) -> str:
+    session.add(
+        RawIngestionRecord(
+            raw_record_id="RAW-900001",
+            batch_id="BATCH-TEST",
+            source_entity_type="SHIPMENT",
+            source_record_id=None,
+            payload={},
+            received_at=NOW,
+        )
+    )
+    session.flush()
+    session.add(
+        DataException(
+            exception_id="EXC-900001",
+            batch_id="BATCH-TEST",
+            raw_record_id="RAW-900001",
+            source_entity_type="SHIPMENT",
+            source_record_id=None,
+            issue_type=IssueType.SITE_ATTRIBUTION_CONFLICT,
+            rule_id="TEST-001",
+            severity=Severity.CRITICAL,
+            detection_status=DetectionStatus.DETECTED,
+            detected_at=NOW,
+            disposition=Disposition.QUARANTINED,
+            related_entity_ids={},
+            evidence={},
+            supplier_id=supplier_id,
+            corrected_score_id=None,
+        )
+    )
+    session.commit()
+    return "EXC-900001"
+
+
+def test_recalculate_versions_when_only_open_critical_exceptions_change(session, cfg):
+    service(session, cfg).calculate(CalculationRequest(Q3_2025, ["SUP-000001"], None))
+    (v1,) = scores_of(session, Q3_2025)
+    exception_id = _open_critical_exception(session, "SUP-000001")
+    outcome = service(session, cfg).recalculate(
+        CalculationRequest(Q3_2025, ["SUP-000001"], None), "exception raised"
+    )
+    v2 = session.get(SupplierScore, outcome.superseded[v1.score_id])
+    assert v2.decision in (Decision.HOLD_FOR_DATA_REVIEW, Decision.SUSPEND_PENDING_REVIEW)
+    assert v2.explanation["exceptions"] == [exception_id]
+    rebuilt = rebuild_from_lineage(session, v2.score_id)
+    assert rebuilt.evidence_fingerprint == v2.evidence_fingerprint
+
+
+def test_snapshot_timestamp_is_deterministic_in_score_history(scored):
+    (snap,) = scored.scalars(sa.select(ScoringConfigSnapshot)).all()
+    assert snap.created_at == WINDOWS[0].cutoff + timedelta(days=1)
+
+
+def test_pending_session_changes_are_rejected(session, cfg):
+    session.add(
+        Supplier(
+            supplier_id="SUP-900002",
+            supplier_name="Synthetic Pending Supplier",
+            supplier_category=SupplierCategory.ELECTRONICS,
+            country="Germany",
+            region=Region.EMEA,
+            supplier_status=SupplierStatus.ACTIVE,
+            onboarding_date=date(2024, 1, 1),
+            created_at=datetime(2024, 1, 1, tzinfo=UTC),
+            updated_at=datetime(2024, 1, 1, tzinfo=UTC),
+        )
+    )
+    with pytest.raises(RuntimeError, match="pending"):
+        service(session, cfg).calculate(CalculationRequest(Q3_2025, None, None))
+    session.rollback()
+    assert count_scores(session) == 0

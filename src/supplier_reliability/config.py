@@ -7,7 +7,7 @@ from pathlib import Path
 from typing import Literal
 
 import yaml
-from pydantic import BaseModel, ConfigDict, model_validator
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 ComponentName = Literal["delivery", "quality", "cost", "capacity", "compliance", "disruption"]
@@ -71,6 +71,7 @@ class ScoringConfig(_Strict):
     severity_weights: dict[str, float]
     recency_days: int = 90
     lookback_days: int = 180
+    window_months: int = Field(default=12, ge=1)  # trailing scorecard window (R25)
     resolved_multiplier: float = 0.5
     inactive_site_multiplier: float = 0.5
     dedup_window_days: int = 7

@@ -49,6 +49,7 @@ from supplier_reliability.services.scoring.evidence import (
     ExcludedRecord,
     collect_evidence,
     quarter_windows,
+    scorecard_windows,
 )
 
 from .factories import GraphBuilder, utc
@@ -123,7 +124,59 @@ def test_quarter_windows_cover_reference_period():
     assert all(a.end + timedelta(seconds=1) == b.start for a, b in zip(ws, ws[1:], strict=False))
 
 
+def test_scorecard_windows_trailing_months_at_quarter_ends():
+    ws = scorecard_windows(utc(2025, 1, 1), utc(2026, 6, 30, 23, 59, 59), 12)
+    assert len(ws) == 6
+    assert all(w.cutoff == w.end for w in ws)
+    q1_end = utc(2025, 3, 31, 23, 59, 59)
+    assert ws[0] == EvaluationWindow(start=utc(2025, 1, 1), end=q1_end, cutoff=q1_end)  # clipped
+    q4_end = utc(2025, 12, 31, 23, 59, 59)
+    assert ws[3] == EvaluationWindow(start=utc(2025, 1, 1), end=q4_end, cutoff=q4_end)
+    q6_end = utc(2026, 6, 30, 23, 59, 59)
+    assert ws[5] == EvaluationWindow(start=utc(2025, 7, 1), end=q6_end, cutoff=q6_end)
+    short = scorecard_windows(utc(2025, 1, 1), utc(2026, 6, 30, 23, 59, 59), 3)
+    assert short == quarter_windows(utc(2025, 1, 1), utc(2026, 6, 30, 23, 59, 59))
+    with pytest.raises(ValueError):
+        scorecard_windows(utc(2025, 1, 1), utc(2026, 6, 30, 23, 59, 59), 0)
+
+
 # --- delivery -------------------------------------------------------------------------------
+
+
+def test_delivery_obs_carries_the_events_that_determined_the_arrival(graph, db_session):
+    sup = graph.supplier_graph()
+    shp = _shipment(graph, sup, utc(2025, 2, 1))
+    ev = graph.event(shipment_id=shp, event_type=ARRIVED, event_timestamp=utc(2025, 2, 1, 6))
+    fix = graph.correction(shipment_id=shp, corrects_event_id=ev, corrected_value=utc(2025, 2, 3),
+                           recorded_timestamp=utc(2025, 2, 10))  # fmt: skip
+    graph.correction(shipment_id=shp, corrects_event_id=ev, corrected_value=utc(2025, 2, 1, 1),
+                     event_timestamp=utc(2025, 2, 14),
+                     recorded_timestamp=utc(2025, 2, 20))  # fmt: skip
+    (obs,) = one(db_session, sup.supplier_id, q1(cutoff=utc(2025, 2, 15))).deliveries
+    assert [e.delivery_event_id for e in obs.events] == [ev, fix]  # the late one is not used
+    arrival, correction = obs.events
+    assert arrival.event_type == ARRIVED and arrival.event_timestamp == utc(2025, 2, 1, 6)
+    assert arrival.recorded_timestamp == utc(2025, 2, 1, 7) and arrival.corrected_value is None
+    assert correction.event_type == DeliveryEventType.CORRECTION
+    assert correction.corrected_value == utc(2025, 2, 3)
+    overdue = _shipment(graph, sup, utc(2025, 2, 2))
+    (none,) = [d for d in one(db_session, sup.supplier_id).deliveries if d.shipment_id == overdue]
+    assert none.events == ()
+
+
+def test_only_record_ids_restricts_delivery_events(graph, db_session):
+    sup = graph.supplier_graph()
+    shp = _shipment(graph, sup, utc(2025, 2, 1))
+    used = graph.event(shipment_id=shp, event_type=ARRIVED, event_timestamp=utc(2025, 2, 1, 6))
+    graph.event(shipment_id=shp, event_type=ARRIVED, event_timestamp=utc(2025, 1, 30),
+                recorded_timestamp=utc(2025, 1, 30, 1))  # back-dated, recorded first  # fmt: skip
+    assert one(db_session, sup.supplier_id).deliveries[0].arrived_known == utc(2025, 1, 30)
+    only = {"shipment": {shp}, "delivery_event": {used}}
+    b = collect_evidence(db_session, [sup.supplier_id], q1(), lookback_days=LOOKBACK,
+                         only_record_ids=only)[sup.supplier_id]  # fmt: skip
+    (obs,) = b.deliveries
+    assert obs.arrived_known == utc(2025, 2, 1, 6)
+    assert [e.delivery_event_id for e in obs.events] == [used]
 
 
 def test_shipment_not_yet_due_excluded(graph, db_session):

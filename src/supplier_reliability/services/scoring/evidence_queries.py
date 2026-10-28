@@ -86,10 +86,16 @@ def shipments(
 
 
 def arrival_events(
-    session: Session, ids: Ids, start: datetime, end: datetime, *, only: Only = None
+    session: Session,
+    ids: Ids,
+    start: datetime,
+    end: datetime,
+    *,
+    only: Only = None,
+    only_events: Only = None,
 ) -> Sequence[Row]:
     """ARRIVED and CORRECTION events of shipments with expected delivery in [start, end]
-    (`only`: shipment ids)."""
+    (`only`: shipment ids, `only_events`: delivery event ids)."""
     stmt = (
         sa.select(
             DeliveryEvent.delivery_event_id,
@@ -106,6 +112,7 @@ def arrival_events(
             Shipment.expected_delivery_timestamp.between(start, end),
             DeliveryEvent.event_type.in_([DeliveryEventType.ARRIVED, DeliveryEventType.CORRECTION]),
             _of(Shipment.shipment_id, only),
+            _of(DeliveryEvent.delivery_event_id, only_events),
         )
     )
     return session.execute(stmt).all()

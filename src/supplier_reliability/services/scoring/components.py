@@ -165,7 +165,7 @@ def score_delivery(ev: EvidenceBundle, cfg: ScoringConfig) -> ComponentResult:
             observations=n,
             coverage=coverage,
             metrics={"eligible_count": n, "known_outcomes": known, "coverage": _s(coverage)},
-            sources=[d.shipment_id for d in ev.deliveries],
+            sources=_delivery_sources(ev),
         )
 
     count = Decimal(n)
@@ -194,9 +194,16 @@ def score_delivery(ev: EvidenceBundle, cfg: ScoringConfig) -> ComponentResult:
             "coverage": _s(coverage),
         },
         missing_reason=None,
-        source_record_ids=sorted(d.shipment_id for d in ev.deliveries),
+        source_record_ids=_delivery_sources(ev),
         flags={},
     )
+
+
+def _delivery_sources(ev: EvidenceBundle) -> list[str]:
+    """Due shipments plus the delivery events that determined their arrivals (lineage)."""
+    shipments = {d.shipment_id for d in ev.deliveries}
+    events = {e.delivery_event_id for d in ev.deliveries for e in d.events}
+    return sorted(shipments | events)
 
 
 # --- quality ----------------------------------------------------------------------------------

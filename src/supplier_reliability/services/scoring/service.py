@@ -9,17 +9,26 @@ separators (",", ":")) of the ScoringConfig alone. The ScoringConfigSnapshot sto
 JSON, so a snapshot is verifiable against its hash and generator/anomaly settings never change a
 score's identity.
 
-Every public call is ONE transaction (commit on success, rollback on error): the snapshot upsert
-(first: supplier_scores.config_hash is a FK, R8), the score rows and their score_evidence rows.
+Transactions: the service OWNS commit/rollback. Every public call is ONE transaction (commit on
+success, rollback on error) holding the snapshot upsert (first: supplier_scores.config_hash is a
+FK, R8), the score rows and their score_evidence rows. Because it commits, a call refuses to
+start (RuntimeError) while the session holds pending new/dirty/deleted objects, so it never
+commits a caller's unrelated half-done work.
 - calculate: a current row for the key -> `existing`; otherwise score and insert version 1.
+  calculate with a later cutoff for an already scored window is simply another evaluation (new
+  key) and is NOT linked to the earlier one; use `restate` to link and report differences.
 - recalculate: recompute; fingerprint equal to the current row's -> `unchanged` (no write);
   otherwise supersede in the schema-enforced order: demote old (is_current=False) + flush,
   insert version+1 + flush, set old.superseded_by_score_id + flush. No current row -> version 1.
+  If the current row is a restatement, the new version keeps its restates_score_id and its
+  differences_from_restated are recomputed against that same restated score.
 - restate: the same window with a later cutoff C' is a new evaluation (new key). The new row's
   restates_score_id is the current score of the same supplier/S/E/scoring_version/config with
   the greatest cutoff < C', and explanation.differences_from_restated holds per-component and
-  overall {"from", "to", "delta"} plus evidence ids added/removed (included lineage sets).
-- score_history: `calculate` for every supplier per window with calculated_at = cutoff + 1 day.
+  overall {"from", "to", "delta"} plus, per component, the included lineage ids added/removed:
+  "evidence": {component: {"added": [...], "removed": [...]}}.
+- score_history: `calculate` for every supplier per window with calculated_at = cutoff + 1 day
+  (the config snapshot, if created, gets the first window's calculated_at too).
 
 Score ids SCORE-2026-NNNNNN come from max(existing) + 1, read once inside the transaction. That is
 safe on SQLite (single writer). Concurrent writers on PostgreSQL would need a sequence or a retry
@@ -40,6 +49,10 @@ each requirement's certification from its contribution) through `collect_evidenc
 only_record_ids=...)`, so every as-of-C derivation is the same code, and scores them with the
 ScoringConfig from the snapshot. The open CRITICAL exceptions are taken from the stored
 explanation ("exceptions"), as they are not record lineage (R17: they are processing-time flags).
+Delivery lineage includes the ARRIVED/CORRECTION events that determined each arrival, and the
+rebuild loads only those events, so a back-dated event inserted later cannot change it.
+Known limitation (deferred): a risk signal's site_active is re-derived from the site row as it is
+now (site status/effective dates are master data without history), not from lineage.
 """
 
 import hashlib
@@ -81,6 +94,7 @@ SCORE_ID_PREFIX = "SCORE-2026-"
 _SCORE_ID_MAX = 999_999
 _ENTITY_BY_PREFIX = (
     ("SHP-", "shipment"),
+    ("EVT-", "delivery_event"),
     ("INS-", "inspection"),
     ("INV-", "invoice"),
     ("POL-", "po_line"),
@@ -218,6 +232,12 @@ class ScoringService:
             )
 
     def _transaction(self, work: Callable[[CalculationOutcome], None]) -> CalculationOutcome:
+        s = self.session
+        if s.new or s.dirty or s.deleted:
+            raise RuntimeError(
+                "session has pending changes; commit or roll them back before calling the "
+                "scoring service (it commits its own transaction)"
+            )
         out = CalculationOutcome()
         self._next_number = None
         try:
@@ -244,14 +264,14 @@ class ScoringService:
         self._next_number = first + n
         return [f"{SCORE_ID_PREFIX}{i:06d}" for i in range(first, first + n)]
 
-    def _ensure_snapshot(self) -> None:
+    def _ensure_snapshot(self, created_at: datetime) -> None:
         if self.session.get(ScoringConfigSnapshot, self.config_hash) is None:
             self.session.add(
                 ScoringConfigSnapshot(
                     config_hash=self.config_hash,
                     scoring_version=self.cfg.scoring_version,
                     config=self.cfg.model_dump(mode="json"),
-                    created_at=ensure_utc(self.clock()),
+                    created_at=ensure_utc(created_at),
                 )
             )
             self.session.flush()
@@ -307,6 +327,9 @@ class ScoringService:
         keys = self._keys(ids, req.window)
         current = self._current(keys.values())
         scored = self._score(ids, req.window)
+        restated = self._by_id(
+            [row.restates_score_id for row in current.values() if row.restates_score_id]
+        )
         fresh: list[_NewScore] = []
         changed: list[tuple[SupplierScore, _NewScore]] = []
         for sid in ids:
@@ -317,7 +340,15 @@ class ScoringService:
             elif old.evidence_fingerprint == result.evidence_fingerprint:
                 out.unchanged.append(old.score_id)
             else:
-                new = _NewScore(sid, keys[sid], bundle, result, old.version_number + 1, reason)
+                new = _NewScore(
+                    sid,
+                    keys[sid],
+                    bundle,
+                    result,
+                    old.version_number + 1,
+                    reason,
+                    restated.get(old.restates_score_id or ""),
+                )
                 changed.append((old, new))
         # supersession write order (schema-enforced): demote, insert, link
         for old, _ in changed:
@@ -329,6 +360,12 @@ class ScoringService:
             out.superseded[old.score_id] = new_id
         self.session.flush()
         out.created.extend(new_ids[len(changed) :])
+
+    def _by_id(self, score_ids: list[str]) -> dict[str, SupplierScore]:
+        if not score_ids:
+            return {}
+        stmt = sa.select(SupplierScore).where(SupplierScore.score_id.in_(sorted(set(score_ids))))
+        return {row.score_id: row for row in self.session.scalars(stmt)}
 
     def _restate(
         self,
@@ -376,7 +413,7 @@ class ScoringService:
         """Bulk-insert the scores and their lineage; returns the new ids in `new` order."""
         if not new:
             return []
-        self._ensure_snapshot()
+        self._ensure_snapshot(calculated_at)
         ids = self._allocate_ids(len(new))
         old_included = self._included_ids([n.restates.score_id for n in new if n.restates])
         score_rows, evidence_rows = [], []
@@ -385,7 +422,7 @@ class ScoringService:
             if n.restates is not None:
                 explanation = explanation | {
                     "differences_from_restated": _differences(
-                        n.restates, n.result, old_included.get(n.restates.score_id, set())
+                        n.restates, n.result, old_included.get(n.restates.score_id, {})
                     )
                 }
             score_rows.append(self._score_row(score_id, n, explanation, calculated_at))
@@ -396,15 +433,16 @@ class ScoringService:
         self.session.flush()
         return ids
 
-    def _included_ids(self, score_ids: list[str]) -> dict[str, set[str]]:
+    def _included_ids(self, score_ids: list[str]) -> dict[str, dict[str, set[str]]]:
+        """score_id -> component -> included source record ids."""
         if not score_ids:
             return {}
-        stmt = sa.select(ScoreEvidence.score_id, ScoreEvidence.source_record_id).where(
-            ScoreEvidence.score_id.in_(score_ids), ScoreEvidence.included.is_(True)
-        )
-        out: dict[str, set[str]] = defaultdict(set)
-        for score_id, record_id in self.session.execute(stmt):
-            out[score_id].add(record_id)
+        stmt = sa.select(
+            ScoreEvidence.score_id, ScoreEvidence.component, ScoreEvidence.source_record_id
+        ).where(ScoreEvidence.score_id.in_(score_ids), ScoreEvidence.included.is_(True))
+        out: dict[str, dict[str, set[str]]] = defaultdict(lambda: defaultdict(set))
+        for score_id, component, record_id in self.session.execute(stmt):
+            out[score_id][ComponentName(component).value].add(record_id)
         return out
 
     def _score_row(
@@ -512,8 +550,9 @@ def _delta(old: Decimal | None, new: Decimal | None) -> dict[str, str | None]:
     }
 
 
-def _differences(old: SupplierScore, new: ScoreResult, old_ids: set[str]) -> dict[str, Any]:
-    new_ids = {i for c in new.components.values() for i in c.source_record_ids}
+def _differences(
+    old: SupplierScore, new: ScoreResult, old_ids: dict[str, set[str]]
+) -> dict[str, Any]:
     out: dict[str, Any] = {
         "restated_score_id": old.score_id,
         "restated_data_cutoff": _iso(old.data_cutoff_timestamp),
@@ -521,8 +560,12 @@ def _differences(old: SupplierScore, new: ScoreResult, old_ids: set[str]) -> dic
     for name in _COMPONENTS:
         out[name] = _delta(getattr(old, f"{name}_score"), new.components[name].score)
     out["overall"] = _delta(old.overall_score, new.overall.overall)
-    out["evidence_added"] = sorted(new_ids - old_ids)
-    out["evidence_removed"] = sorted(old_ids - new_ids)
+    evidence: dict[str, dict[str, list[str]]] = {}
+    for name in _COMPONENTS:
+        before = old_ids.get(name, set())
+        after = set(new.components[name].source_record_ids)
+        evidence[name] = {"added": sorted(after - before), "removed": sorted(before - after)}
+    out["evidence"] = evidence
     return out
 
 

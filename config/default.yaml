@@ -42,6 +42,7 @@ scoring:
     CRITICAL: 50
   recency_days: 90
   lookback_days: 180
+  window_months: 12        # trailing calendar months per scorecard window (R25)
   resolved_multiplier: 0.5
   inactive_site_multiplier: 0.5
   dedup_window_days: 7

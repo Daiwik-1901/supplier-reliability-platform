@@ -10,8 +10,9 @@ Explanation: JSON-serialisable (Decimals as strings, datetimes ISO-8601 with a t
 the cut-off amounts are reported as `truncated_count` / `excluded_records_truncated_count`. The
 fingerprint always covers every included observation.
 
-Evidence fingerprint (R23): sha256 hex of canonical JSON (sorted keys, separators (",", ":")) of
-{"scoring_version", "config_hash", "observations"}. Observations are exactly the lineage set
+Evidence fingerprint (R23, R26): sha256 hex of canonical JSON (sorted keys, separators (",", ":"))
+of {"scoring_version", "config_hash", "open_critical_exception_ids" (sorted; they change the
+decision), "observations"}. Observations are exactly the lineage set
 (R24): the items in the components' `source_record_ids` (every record a component evaluated,
 whether or not it reached its minimum observation count; deliberately unused records are listed
 in `excluded_record_ids` with a reason instead). Each is a dict {component, record_id, <values
@@ -252,6 +253,17 @@ def evidence_observations(bundle: EvidenceBundle) -> list[dict[str, Any]]:
 
     for d in bundle.deliveries:
         add(ComponentName.delivery, d.shipment_id, expected=d.expected, arrived=d.arrived_known)
+        for e in d.events:
+            add(
+                ComponentName.delivery,
+                e.delivery_event_id,
+                kind="event",
+                shipment_id=d.shipment_id,
+                event_type=e.event_type,
+                event_timestamp=e.event_timestamp,
+                recorded_timestamp=e.recorded_timestamp,
+                corrected_value=e.corrected_value,
+            )
     for i in bundle.inspections:
         add(
             ComponentName.quality,
@@ -328,6 +340,7 @@ def _fingerprint(
     payload = {
         "scoring_version": cfg.scoring_version,
         "config_hash": config_hash,
+        "open_critical_exception_ids": sorted(bundle.open_critical_exception_ids),
         "observations": _observations(bundle, results),
     }
     return hashlib.sha256(_canonical(payload).encode("utf-8")).hexdigest()

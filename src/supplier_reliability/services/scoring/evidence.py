@@ -118,7 +118,36 @@ def quarter_windows(reference_start: datetime, reference_end: datetime) -> list[
     return out
 
 
+def scorecard_windows(
+    reference_start: datetime, reference_end: datetime, window_months: int
+) -> list[EvaluationWindow]:
+    """Scorecard windows (R25): one per calendar quarter end in the reference period, with
+    cutoff = end = that quarter's last second (clipped to reference_end) and start = the first
+    instant of the month `window_months - 1` months before the end's month, clipped to
+    reference_start. window_months = 3 gives exactly `quarter_windows`."""
+    if window_months < 1:
+        raise ValueError(f"window_months must be >= 1, got {window_months}")
+    first = ensure_utc(reference_start)
+    out: list[EvaluationWindow] = []
+    for quarter in quarter_windows(reference_start, reference_end):
+        months = quarter.end.year * 12 + quarter.end.month - 1 - (window_months - 1)
+        start = datetime(months // 12, months % 12 + 1, 1, tzinfo=UTC)
+        out.append(EvaluationWindow(max(start, first), quarter.end, quarter.end))
+    return out
+
+
 # --- evidence records -----------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class DeliveryEventObs:
+    """A delivery event that determined a shipment's arrival known at C (lineage)."""
+
+    delivery_event_id: str
+    event_type: DeliveryEventType  # ARRIVED or CORRECTION
+    event_timestamp: datetime
+    recorded_timestamp: datetime
+    corrected_value: datetime | None  # parsed value of a CORRECTION, else None
 
 
 @dataclass(frozen=True)
@@ -126,6 +155,9 @@ class DeliveryObs:
     shipment_id: str
     expected: datetime
     arrived_known: datetime | None  # effective arrival known at C, or None (overdue)
+    # the ARRIVED event used and the valid CORRECTIONs of it applied (recorded <= C), in
+    # recording order; empty when no arrival is known
+    events: tuple[DeliveryEventObs, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -215,6 +247,7 @@ class EvidenceBundle:
 RESTRICTABLE_ENTITIES = frozenset(
     {
         "shipment",
+        "delivery_event",
         "inspection",
         "invoice",
         "po_line",
@@ -249,7 +282,8 @@ def collect_evidence(
     the source records loaded to exactly those ids (a missing key means none of that entity);
     every derivation (eligibility, arrival as of C, latest inspection, scope rule, current
     certification, site/resolution state) then runs unchanged over that subset. Delivery
-    events are loaded for the restricted shipments. Used by `rebuild_from_lineage`.
+    events of the restricted shipments are restricted to the "delivery_event" ids. Used by
+    `rebuild_from_lineage`.
     """
     ids = None if supplier_ids is None else sorted(set(supplier_ids))
     known = q.existing_supplier_ids(session, ids)
@@ -264,7 +298,7 @@ def collect_evidence(
     def only(entity: str) -> Collection[str] | None:
         return None if only_record_ids is None else only_record_ids.get(entity, ())
 
-    _deliveries(session, ids, window, acc, only("shipment"))
+    _deliveries(session, ids, window, acc, only("shipment"), only("delivery_event"))
     _inspections(session, ids, window, acc, only("inspection"))
     _invoices(session, ids, window, acc, only("invoice"))
     _demand(session, ids, window, acc, only("po_line"))
@@ -319,7 +353,12 @@ def _exclude(
 
 
 def _deliveries(
-    session: Session, ids, w: EvaluationWindow, acc: dict[str, _Lists], only: q.Only
+    session: Session,
+    ids,
+    w: EvaluationWindow,
+    acc: dict[str, _Lists],
+    only: q.Only,
+    only_events: q.Only,
 ) -> None:
     c, top = w.cutoff, w.occurrence_end
     due: dict[str, tuple[str, datetime]] = {}  # shipment_id -> (supplier_id, expected)
@@ -337,7 +376,7 @@ def _deliveries(
             due[r.shipment_id] = (r.supplier_id, r.expected_delivery_timestamp)
 
     events: dict[str, list[Any]] = defaultdict(list)
-    for e in q.arrival_events(session, ids, w.start, top, only=only):
+    for e in q.arrival_events(session, ids, w.start, top, only=only, only_events=only_events):
         if e.shipment_id not in due:
             continue  # cancelled or not known at C
         if e.recorded_timestamp <= c:
@@ -348,8 +387,8 @@ def _deliveries(
                      "recorded_after_cutoff")  # fmt: skip
 
     for shipment_id, (sup, expected) in due.items():
-        arrived, unparseable = _known_arrival(events.get(shipment_id, []), c)
-        acc[sup]["deliveries"].append(DeliveryObs(shipment_id, expected, arrived))
+        arrived, unparseable, used = _known_arrival(events.get(shipment_id, []), c)
+        acc[sup]["deliveries"].append(DeliveryObs(shipment_id, expected, arrived, used))
         for event_id in unparseable:
             _exclude(acc[sup], "delivery_event", event_id, _C.delivery, "correction_unparseable")
 
@@ -363,9 +402,18 @@ def _corrected_value(event: Any) -> datetime | None:
         return None
 
 
-def _known_arrival(events: list[Any], cutoff: datetime) -> tuple[datetime | None, list[str]]:
+def _event_obs(e: Any, corrected: datetime | None = None) -> DeliveryEventObs:
+    return DeliveryEventObs(
+        e.delivery_event_id, e.event_type, e.event_timestamp, e.recorded_timestamp, corrected
+    )
+
+
+def _known_arrival(
+    events: list[Any], cutoff: datetime
+) -> tuple[datetime | None, list[str], tuple[DeliveryEventObs, ...]]:
     """R12: (effective ARRIVED timestamp at the cutoff or None, ids of unparseable corrections
-    of that arrival) from events all recorded <= cutoff."""
+    of that arrival, the events used: the ARRIVED plus its valid corrections in recording
+    order) from events all recorded <= cutoff."""
     key = lambda e: (e.recorded_timestamp, e.delivery_event_id)  # noqa: E731
     arrivals = sorted(
         (
@@ -376,9 +424,9 @@ def _known_arrival(events: list[Any], cutoff: datetime) -> tuple[datetime | None
         key=key,
     )
     if not arrivals:
-        return None, []
+        return None, [], ()
     arrived = arrivals[0]
-    when, unparseable = arrived.event_timestamp, []
+    when, unparseable, used = arrived.event_timestamp, [], [_event_obs(arrived)]
     for e in sorted(events, key=key):
         meta = e.event_metadata or {}
         if (
@@ -392,7 +440,8 @@ def _known_arrival(events: list[Any], cutoff: datetime) -> tuple[datetime | None
             unparseable.append(e.delivery_event_id)
         else:
             when = value  # the latest valid correction wins
-    return (when if when <= cutoff else None), unparseable
+            used.append(_event_obs(e, value))
+    return (when if when <= cutoff else None), unparseable, tuple(used)
 
 
 def _inspections(

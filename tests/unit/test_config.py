@@ -88,6 +88,14 @@ def test_settings_defaults_and_env_prefix(monkeypatch):
     assert settings.app_env == "local"
 
 
+def test_window_months_default_and_validation(app_config):
+    assert app_config.scoring.window_months == 12
+    data = _data(app_config)
+    data["scoring"]["window_months"] = 0
+    with pytest.raises(ValidationError):
+        AppConfig.model_validate(data)
+
+
 def test_canonical_json_has_no_whitespace(app_config):
     assert " " not in app_config.canonical_json()
     assert json.loads(app_config.canonical_json())["scoring"]["grace_hours"] == 24

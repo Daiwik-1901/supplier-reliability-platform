@@ -14,6 +14,7 @@ from supplier_reliability.domain.enums import (
     ComplianceState,
     ComponentName,
     Decision,
+    DeliveryEventType,
     ReliabilityCategory,
     RiskSignalType,
     Severity,
@@ -30,7 +31,11 @@ from supplier_reliability.services.scoring.engine import (
     _observations,
     score_supplier,
 )
-from supplier_reliability.services.scoring.evidence import DeliveryObs, ExcludedRecord
+from supplier_reliability.services.scoring.evidence import (
+    DeliveryEventObs,
+    DeliveryObs,
+    ExcludedRecord,
+)
 
 from .builders import (
     FEB,
@@ -354,6 +359,7 @@ def test_fingerprint_is_sha256_of_canonical_json_of_included_observations(cfg):
     payload = {
         "scoring_version": cfg.scoring_version,
         "config_hash": "cfg-hash",
+        "open_critical_exception_ids": [],
         "observations": [
             {
                 "component": "delivery",
@@ -365,6 +371,46 @@ def test_fingerprint_is_sha256_of_canonical_json_of_included_observations(cfg):
     }
     text = json.dumps(payload, sort_keys=True, separators=(",", ":"))
     assert fingerprint(b, cfg, "cfg-hash") == hashlib.sha256(text.encode()).hexdigest()
+
+
+def test_fingerprint_covers_sorted_open_critical_exceptions(cfg):
+    base = fingerprint(full_bundle(), cfg)
+    one = fingerprint(full_bundle(open_critical_exception_ids=["EXC-000002", "EXC-000001"]), cfg)
+    same = fingerprint(full_bundle(open_critical_exception_ids=["EXC-000001", "EXC-000002"]), cfg)
+    assert one != base and one == same
+
+
+def _with_events(obs: DeliveryObs) -> DeliveryObs:
+    arrival = DeliveryEventObs("EVT-1", DeliveryEventType.ARRIVED, obs.arrived_known,
+                               obs.arrived_known + timedelta(hours=1), None)  # fmt: skip
+    return DeliveryObs(obs.shipment_id, obs.expected, obs.arrived_known, (arrival,))
+
+
+def test_delivery_events_are_lineage_and_fingerprint_items(cfg):
+    d = deliveries(on_time=10)
+    d[0] = _with_events(d[0])
+    s = score_supplier(full_bundle(deliveries=d), cfg, "h")
+    assert "EVT-1" in s.components["delivery"].source_record_ids
+    assert s.components["delivery"].observations == 10  # still counts shipments
+    obs = [o for o in _observations(full_bundle(deliveries=d), s.components)
+           if o["record_id"] == "EVT-1"]  # fmt: skip
+    assert obs == [
+        {
+            "component": "delivery",
+            "record_id": "EVT-1",
+            "kind": "event",
+            "shipment_id": d[0].shipment_id,
+            "event_type": "ARRIVED",
+            "event_timestamp": "2026-01-02T00:00:00Z",
+            "recorded_timestamp": "2026-01-02T01:00:00Z",
+            "corrected_value": None,
+        }
+    ]
+    recorded_later = DeliveryObs(d[0].shipment_id, d[0].expected, d[0].arrived_known, (
+        DeliveryEventObs("EVT-1", DeliveryEventType.ARRIVED, d[0].arrived_known,
+                         d[0].arrived_known + timedelta(hours=2), None),))  # fmt: skip
+    changed = [recorded_later, *d[1:]]
+    assert fingerprint(full_bundle(deliveries=changed), cfg) != s.evidence_fingerprint
 
 
 def test_score_supplier_deterministic_fingerprint(cfg):
@@ -426,7 +472,8 @@ def test_precedence_insufficient_plus_compliance_failure_plus_exception(cfg):
 
 def _kind_ids(b) -> dict[str, set[str]]:
     return {
-        "delivery": {d.shipment_id for d in b.deliveries},
+        "delivery": {d.shipment_id for d in b.deliveries}
+        | {e.delivery_event_id for d in b.deliveries for e in d.events},
         "quality": {i.inspection_id for i in b.inspections},
         "cost": {i.invoice_id for i in b.invoices},
         "capacity": {d.po_line_id for d in b.demand}
@@ -439,6 +486,9 @@ def _kind_ids(b) -> dict[str, set[str]]:
 R24_BUNDLES = {
     "full": lambda: full_bundle(),
     "missing_delivery": lambda: full_bundle(deliveries=deliveries(on_time=4)),
+    "delivery_events": lambda: full_bundle(
+        deliveries=[_with_events(o) if i == 0 else o for i, o in enumerate(deliveries(on_time=6))]
+    ),
     "capacity_no_demand_month": lambda: full_bundle(
         capacities=[cap(JAN, 100, cid="CAP-1"), cap(FEB, 100, cid="CAP-2")]
     ),
