@@ -97,6 +97,8 @@ class ScoringConfig(_Strict):
         for name, keys in expected.items():
             if set(getattr(self, name)) != keys:
                 raise ValueError(f"{name} must define exactly {sorted(keys)}")
+        if self.severity_weights["NONE"] != 0:
+            raise ValueError("severity_weights NONE must be 0 (attestations carry no penalty)")
         return self
 
     @model_validator(mode="after")

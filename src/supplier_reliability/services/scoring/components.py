@@ -32,11 +32,14 @@ from supplier_reliability.domain.enums import (
     Severity,
 )
 from supplier_reliability.domain.numeric import round_score
-from supplier_reliability.services.scoring.evidence import EvidenceBundle
+from supplier_reliability.services.scoring.evidence import EvidenceBundle, RiskObs
 
 ZERO, ONE, HUNDRED = Decimal(0), Decimal(1), Decimal(100)
 _SECONDS_PER_DAY = Decimal(86400)
 _COVERAGE_QUANTUM = Decimal("0.0001")
+# A validity invariant, deliberately not a ScoringConfig parameter: an arrival more than a year
+# before the due date is a data error (wrong year / swapped fields), not a scoring judgement, so
+# changing it must never change scores and must not require a scoring_version bump.
 _MAX_EARLY_ARRIVAL = timedelta(days=365)
 INFINITE_UTILISATION = "inf"
 
@@ -293,15 +296,19 @@ def score_capacity(ev: EvidenceBundle, cfg: ScoringConfig) -> ComponentResult:
                 f"capacity declaration {c.capacity_declaration_id}: committed {c.committed} "
                 f"exceeds available {c.available}"
             )
+    for d in ev.demand:
+        if d.quantity < 0:
+            raise InvalidEvidenceError(f"PO line {d.po_line_id}: negative demand {d.quantity}")
     unverified = sorted(
         {
             (c.capacity_declaration_id, "capacity_unverified")
             for c in ev.capacities
             if not c.verified
         }
+        | {(d.po_line_id, "zero_quantity_demand") for d in ev.demand if d.quantity == 0}
     )
     if not ev.capacities:
-        return _missing(name, "capacity unknown")
+        return _missing(name, "capacity unknown", excluded=unverified)
     verified = [c for c in ev.capacities if c.verified]
     if not verified:
         return _missing(name, "capacity unverified", excluded=unverified)
@@ -335,19 +342,18 @@ def score_capacity(ev: EvidenceBundle, cfg: ScoringConfig) -> ComponentResult:
             excluded=excluded,
         )
 
-    utils: dict[date, Decimal | None] = {  # None = exhausted (free <= 0 while required > 0)
-        m: (required[m] / free[m] if free[m] > 0 else None) for m in months
-    }
-    exhausted = [m for m in months if utils[m] is None]
+    # finite utilisation per month; months with free <= 0 (and required > 0) are exhausted
+    finite: dict[date, Decimal] = {m: required[m] / free[m] for m in months if free[m] > 0}
+    exhausted = [m for m in months if m not in finite]
     if exhausted:
         worst = exhausted[0]
         score, util_text = ZERO, INFINITE_UTILISATION
     else:
-        worst = max(months, key=lambda m: (utils[m], -m.toordinal()))  # earliest on ties
-        score, util_text = _utilisation_score(utils[worst], cfg), _s(utils[worst])  # type: ignore[arg-type]
+        worst = max(months, key=lambda m: (finite[m], -m.toordinal()))  # earliest on ties
+        score, util_text = _utilisation_score(finite[worst], cfg), _s(finite[worst])
     monthly = {
-        m.isoformat(): INFINITE_UTILISATION if utils[m] is None else _s(utils[m]) for m in months
-    }  # type: ignore[arg-type]
+        m.isoformat(): _s(finite[m]) if m in finite else INFINITE_UTILISATION for m in months
+    }
     sources = {line for m in months for line in lines[m]} | {
         cid for m in months for cid in declarations[m]
     }
@@ -442,7 +448,7 @@ def score_disruption(ev: EvidenceBundle, cfg: ScoringConfig) -> ComponentResult:
         return _missing(name, "no risk monitoring evidence")
 
     weights = {k: _d(v) for k, v in cfg.severity_weights.items()}
-    groups: dict[str, list] = defaultdict(list)
+    groups: dict[str, list[RiskObs]] = defaultdict(list)
     for r in ev.risks:
         groups[r.dedup_key].append(r)
     kept, dropped = [], []
@@ -454,6 +460,8 @@ def score_disruption(ev: EvidenceBundle, cfg: ScoringConfig) -> ComponentResult:
     recency, cutoff = _d(cfg.recency_days), ev.window.cutoff
     penalty = ZERO
     for r in kept:
+        if r.signal_type == RiskSignalType.MONITORING_ATTESTATION:
+            continue  # proof of monitoring only: no penalty by construction
         age_days = max(ZERO, _days(cutoff - r.observed))
         # exp() has no Decimal form: evaluate in float, then convert via str (documented above)
         decay = Decimal(str(math.exp(-float(age_days / recency))))

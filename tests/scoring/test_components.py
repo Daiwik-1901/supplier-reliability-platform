@@ -8,8 +8,9 @@ from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal
 
 import pytest
+from pydantic import ValidationError
 
-from supplier_reliability.config import DeliveryConfig, ScoringConfig
+from supplier_reliability.config import AppConfig, DeliveryConfig, ScoringConfig
 from supplier_reliability.domain.enums import (
     CertificationType,
     ComplianceState,
@@ -670,3 +671,47 @@ def test_results_are_deterministic_and_json_friendly(cfg):
         assert D("0") <= first.score <= D("100")
         assert first.missing_reason is None
         json.dumps(first.metrics)  # metrics are JSON-serialisable
+
+
+# --- fix round 1 ------------------------------------------------------------------------------
+
+
+def test_disruption_fractional_day_recency_literal(cfg):
+    r = score_disruption(bundle(risks=[risk(age_days=12.5)]), cfg)
+    assert r.score == D("73.89")  # 100 - 30*exp(-12.5/90) = 73.8938
+
+
+def test_attestation_contributes_zero_even_if_weights_are_patched(cfg):
+    patched = cfg.model_copy(
+        update={"severity_weights": {**cfg.severity_weights, "NONE": 10}}  # bypasses validation
+    )
+    att = risk("RSK-A", Severity.NONE, signal_type=RiskSignalType.MONITORING_ATTESTATION)
+    r = score_disruption(bundle(risks=[att]), patched)
+    assert r.score == D("100.00") and r.source_record_ids == ["RSK-A"]
+
+
+def test_config_rejects_nonzero_none_severity_weight(app_config):
+    data = app_config.model_dump(mode="json")
+    data["scoring"]["severity_weights"]["NONE"] = 10
+    with pytest.raises(ValidationError, match="NONE"):
+        AppConfig.model_validate(data)
+
+
+def test_capacity_negative_demand_is_invalid_evidence(cfg):
+    bad = demand(JAN, -5, "POL-BAD")
+    with pytest.raises(InvalidEvidenceError, match="POL-BAD"):
+        score_capacity(bundle(demand=[demand(JAN, 90), bad], capacities=[cap(JAN, 100)]), cfg)
+
+
+def test_capacity_zero_quantity_demand_is_reported_not_dropped(cfg):
+    r = score_capacity(
+        bundle(demand=[demand(JAN, 90), demand(JAN, 0, "POL-0")], capacities=[cap(JAN, 100)]), cfg
+    )
+    assert r.score == D("85.00")
+    assert ("POL-0", "zero_quantity_demand") in r.excluded_record_ids
+    assert "POL-0" not in r.source_record_ids
+    only_zero = score_capacity(
+        bundle(demand=[demand(JAN, 0, "POL-0")], capacities=[cap(JAN, 100)]), cfg
+    )
+    assert_missing(only_zero, "no demand in window")
+    assert only_zero.excluded_record_ids == [("POL-0", "zero_quantity_demand")]
