@@ -16,7 +16,8 @@ Evidence fingerprint (R23): sha256 hex of canonical JSON (sorted keys, separator
 whether or not it reached its minimum observation count; deliberately unused records are listed
 in `excluded_record_ids` with a reason instead). Each is a dict {component, record_id, <values
 the component used>} with Decimals/dates as strings, sorted by (component, record_id, canonical
-JSON). Excluded records are not part of it, so evidence that is ignored can never change a score's identity.
+JSON). Excluded records are not part of it, so ignored evidence can never change a score's
+identity.
 """
 
 import hashlib
