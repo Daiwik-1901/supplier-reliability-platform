@@ -170,6 +170,8 @@ class ComplianceObs:
     site_id: str | None
     certification_id: str | None
     state: ComplianceState
+    valid_from: date | None = None  # of the current certification (None: none / not carried)
+    valid_to: date | None = None
 
 
 @dataclass(frozen=True)
@@ -490,6 +492,8 @@ def _compliance(session: Session, ids, w: EvaluationWindow, acc: dict[str, _List
                 req.site_id,
                 None if cert is None else cert.certification_id,
                 _compliance_state(cert, day),
+                None if cert is None else cert.valid_from,
+                None if cert is None else cert.valid_to,
             )
         )
 
