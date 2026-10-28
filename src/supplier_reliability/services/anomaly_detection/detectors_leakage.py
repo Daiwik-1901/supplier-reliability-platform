@@ -5,8 +5,11 @@ whose `evidence_refs` cite a canonical record whose occurrence or recording time
 payload's data_cutoff_timestamp. The per-entity times are SOURCE_TIMES, the very mapping CH-005
 uses (services/validation/source_times.py), loaded in one bulk statement per entity type and id
 chunk for all payloads of the batch, then compared per payload in Python (DATE values at day
-granularity). Cited records that are absent from canonical or of an unknown entity type cannot
-prove leakage and are ignored here.
+granularity). A reference's source_entity_type is matched case-insensitively (stripped and
+lowercased). Cited records that are absent from canonical or of an unknown entity type cannot
+prove leakage and are ignored here. A payload whose data_cutoff_timestamp is missing, naive or
+unparseable cannot be judged: it gets no exception (it is a malformed payload for
+validate_payload / run_validation) and is listed by `skipped_score_payloads`.
 
 Correction (`correct_leakage`, Ruling R4): the eligible-evidence score for the payload's
 supplier and window [evaluation_start, evaluation_end] at its cutoff, via
@@ -57,6 +60,7 @@ def _cited(p: dict[str, Any]) -> list[tuple[str, str]]:
         if not isinstance(ref, dict):
             continue
         entity, record_id = ref.get("source_entity_type"), ref.get("source_record_id")
+        entity = entity.strip().lower() if isinstance(entity, str) else None
         if entity in SOURCE_TIMES and isinstance(record_id, str):
             out.append((entity, record_id))
     return sorted(set(out))
@@ -71,6 +75,21 @@ def _window(p: dict[str, Any]) -> EvaluationWindow | None:
         return EvaluationWindow(start, end, cutoff)
     except ValueError:
         return None
+
+
+SKIP_REASON = "data_cutoff_timestamp missing, unparseable or naive (malformed payload: DC-001)"
+
+
+def skipped_score_payloads(raw_records: Sequence[RawIngestionRecord]) -> list[tuple[str, str]]:
+    """(raw_record_id, reason) of the SUPPLIER_SCORE records leakage detection cannot judge
+    because their cutoff is unusable. They get no exception here: they are malformed payloads,
+    reported by validate_payload / run_validation (DC-001), and detect_raw_batch lists them in
+    DetectionResult.skipped so they never vanish silently."""
+    return [
+        (r.raw_record_id, SKIP_REASON)
+        for r in of_type(raw_records, SUPPLIER_SCORE)
+        if parse_ts(payload(r).get("data_cutoff_timestamp")) is None
+    ]
 
 
 def detect_score_leakage(

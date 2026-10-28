@@ -6,6 +6,7 @@ once per session; every test injects into its own copy of that DB file.
 
 import csv
 import hashlib
+import json
 import shutil
 from collections import Counter
 from collections.abc import Iterator
@@ -204,6 +205,64 @@ def test_injection_is_deterministic(scored_starter_db, tmp_path, gen_cfg, app_co
         raise AssertionError("unreachable")
 
     assert run("one.db") == run("two.db")
+
+
+# PINNED starter batch (default seed, config/default.yaml). The injector's choices (e.g. which
+# (supplier, window) pairs become C positives, via records_after / SOURCE_TIMES) are semantic:
+# any change to generation, scoring or injection that moves these values must update them
+# DELIBERATELY, after checking the new batch is still right.
+PINNED_BATCH_SHA256 = "4f45efb08c88c9f41c0e5e5d5506069f7bfb7cec87b186fd48df281531326859"
+PINNED_POSITIVES = {
+    "SHIPMENT_MISSING_PO": ["RAW-000024", "RAW-000090", "RAW-000131", "RAW-000200", "RAW-000203"],
+    "DELIVERY_BEFORE_DISPATCH": [
+        "RAW-000014",
+        "RAW-000028",
+        "RAW-000065",
+        "RAW-000068",
+        "RAW-000078",
+    ],
+    "SCORE_FUTURE_LEAKAGE": ["RAW-000041", "RAW-000048", "RAW-000123", "RAW-000133", "RAW-000183"],
+    "RISK_SIGNAL_MISSING_PROVENANCE": [
+        "RAW-000017",
+        "RAW-000121",
+        "RAW-000127",
+        "RAW-000148",
+        "RAW-000186",
+    ],
+    "SITE_ATTRIBUTION_CONFLICT": [
+        "RAW-000060",
+        "RAW-000075",
+        "RAW-000102",
+        "RAW-000146",
+        "RAW-000165",
+    ],
+}
+
+
+def _batch_digest(session: Session) -> str:
+    rows = session.execute(
+        sa.select(
+            RawIngestionRecord.raw_record_id,
+            RawIngestionRecord.batch_id,
+            RawIngestionRecord.source_entity_type,
+            RawIngestionRecord.source_record_id,
+            RawIngestionRecord.payload,
+            RawIngestionRecord.received_at,
+        ).order_by(RawIngestionRecord.raw_record_id)
+    )
+    records = [[r[0], r[1], r[2], r[3], r[4], ensure_utc(r[5]).isoformat()] for r in rows]
+    text = json.dumps(records, sort_keys=True, separators=(",", ":"), ensure_ascii=True)
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
+def test_starter_batch_is_pinned(injected):
+    session, result = injected
+    positives = {
+        issue.value: sorted(c.entity_id for c in result.cases if c.issue_type == issue)
+        for issue in IssueType
+    }
+    assert positives == PINNED_POSITIVES
+    assert _batch_digest(session) == PINNED_BATCH_SHA256
 
 
 def test_injection_refuses_an_existing_batch(injected, gen_cfg, app_config):

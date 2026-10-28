@@ -13,7 +13,9 @@ detector C lives in detectors_leakage.py.
   (the only real reference left); related_entity_ids = [po_id] when one is given.
 - B DELIVERY_BEFORE_DISPATCH (DET-B, HIGH, QUARANTINED): an ARRIVED DELIVERY_EVENT payload
   whose event_timestamp is before the EARLIEST canonical DISPATCHED event_timestamp of its
-  shipment_id (as CH-003). related_entity_ids = [shipment_id]; supplier via shipment -> PO.
+  shipment_id (as CH-003). A canonical shipment with no DISPATCHED event falls back to its
+  own dispatch fact, shipments.dispatch_timestamp; evidence["dispatch_source"] says which was
+  used. related_entity_ids = [shipment_id]; supplier via shipment -> PO.
 - D RISK_SIGNAL_MISSING_PROVENANCE (DET-D, MEDIUM, QUARANTINED_PENDING_PROVENANCE): the
   DC-001 findings of `validate_payload` on signal_source, observed_timestamp or
   recorded_timestamp (null, blank, unparseable or naive), mapped rather than re-implemented.
@@ -24,6 +26,10 @@ detector C lives in detectors_leakage.py.
   effective_to, open-ended when null). A site absent from canonical is a missing reference,
   not an attribution conflict, and is not flagged here. related_entity_ids = [po_id, site_id];
   supplier = the PO's supplier.
+
+Classes are independent, so one raw record may carry several exceptions (one per issue type),
+e.g. a shipment whose PO is missing (A) and whose site is not effective at dispatch (E: the
+effective-period check needs no PO; the supplier check needs one, so it is skipped then).
 
 Malformed fields a detector needs (unparseable timestamps, non-object payloads) make it skip
 the record: those are validate_payload findings, not this class.
@@ -237,20 +243,27 @@ def detect_chronology(
         )
         dispatched.update({sid: ensure_utc(ts) for sid, ts in session.execute(stmt)})
     supplier_of: dict[str, str] = {}
+    header_dispatch: dict[str, datetime] = {}  # fallback: the shipment's own dispatch fact
     for i in range(0, len(shipment_ids), _CHUNK):
         stmt = (
-            sa.select(Shipment.shipment_id, PurchaseOrder.supplier_id)
+            sa.select(Shipment.shipment_id, Shipment.dispatch_timestamp, PurchaseOrder.supplier_id)
             .join(PurchaseOrder, PurchaseOrder.po_id == Shipment.po_id)
             .where(Shipment.shipment_id.in_(shipment_ids[i : i + _CHUNK]))
         )
-        supplier_of.update({sid: supplier for sid, supplier in session.execute(stmt)})
+        for sid, dispatch_ts, supplier in session.execute(stmt):
+            supplier_of[sid] = supplier
+            header_dispatch[sid] = ensure_utc(dispatch_ts)
 
     hits = []
     for r in arrivals:
         p = payload(r)
         shipment_id = text(p.get("shipment_id"))
         arrived = parse_ts(p.get("event_timestamp"))
-        first_dispatch = dispatched.get(shipment_id or "")
+        if shipment_id in dispatched:
+            first_dispatch, source = dispatched[shipment_id], "delivery_events.DISPATCHED"
+        else:
+            first_dispatch = header_dispatch.get(shipment_id or "")
+            source = "shipments.dispatch_timestamp"
         if arrived is None or first_dispatch is None or arrived >= first_dispatch:
             continue
         evidence = {
@@ -258,10 +271,12 @@ def detect_chronology(
             "event_type": DeliveryEventType.ARRIVED.value,
             "event_timestamp": iso(arrived),
             "canonical_dispatched_timestamp": iso(first_dispatch),
+            "dispatch_source": source,
             "arrived_before_dispatch_by_seconds": int((first_dispatch - arrived).total_seconds()),
             "expected_condition": (
                 "ARRIVED event_timestamp >= the shipment's earliest canonical DISPATCHED "
-                "event_timestamp (D4)"
+                "event_timestamp, or its shipments.dispatch_timestamp when it has no DISPATCHED "
+                "event (D4)"
             ),
         }
         hits.append(

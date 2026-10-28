@@ -22,6 +22,7 @@ from sqlalchemy.orm import Session
 from supplier_reliability.database import make_engine, make_session_factory
 from supplier_reliability.domain.enums import (
     CalculationStatus,
+    DeliveryEventType,
     DetectionStatus,
     Disposition,
     IssueType,
@@ -31,10 +32,12 @@ from supplier_reliability.domain.enums import (
 from supplier_reliability.domain.numeric import ensure_utc
 from supplier_reliability.models import (
     DataException,
+    DeliveryEvent,
     PurchaseOrder,
     RawIngestionRecord,
     RiskSignal,
     ScoreEvidence,
+    Shipment,
     Site,
     SupplierScore,
 )
@@ -234,6 +237,8 @@ def test_quarantined_signal_not_used_in_scoring(session, injected_db, gen_cfg, a
         r for r in _exceptions(session) if r.issue_type == IssueType.RISK_SIGNAL_MISSING_PROVENANCE
     ]
     assert {r.disposition for r in quarantined} == {Disposition.QUARANTINED_PENDING_PROVENANCE}
+    # Holds by construction: raw records are never promoted into canonical tables (no promotion
+    # path exists), so a quarantined signal cannot reach scoring. This pins that invariant.
     assert disruption() == before
     assert session.scalar(sa.select(sa.func.count()).select_from(RiskSignal)) == signals_before
     service = ScoringService(session, app_config.scoring, lambda: CLOCK)
@@ -468,32 +473,233 @@ def _findings(session: Session) -> set[tuple[str, str]]:
     return {(r.issue_type.value, _content_hash(raw[r.raw_record_id])) for r in _exceptions(session)}
 
 
-def test_detection_ignores_natural_ids(injected_db, tmp_path, app_config):
-    """Metamorphic: permuting every raw natural id (payload id + source_record_id) leaves the
-    set of (issue type, payload content) findings unchanged."""
+CANONICAL_PK = {
+    "SHIPMENT": Shipment.shipment_id,
+    "DELIVERY_EVENT": DeliveryEvent.delivery_event_id,
+    "RISK_SIGNAL": RiskSignal.risk_signal_id,
+    "SUPPLIER_SCORE": SupplierScore.score_id,
+}
+
+
+def _permuted_ids(session: Session, entity_type: str, ids: list[str]) -> list[str]:
+    rng = random.Random(20261028)
+    permuted = ids[:]
+    while permuted == ids:
+        rng.shuffle(permuted)
+    return permuted
+
+
+def _canonical_ids(session: Session, entity_type: str, ids: list[str]) -> list[str]:
+    """Real canonical ids of the same entity, picked deterministically (repeats allowed)."""
+    pk = CANONICAL_PK[entity_type]
+    real = list(session.scalars(sa.select(pk).order_by(pk).limit(len(ids))))
+    return [real[i % len(real)] for i in range(len(ids))]
+
+
+@pytest.mark.parametrize("relabel", [_permuted_ids, _canonical_ids], ids=["permuted", "canonical"])
+def test_detection_ignores_natural_ids(injected_db, tmp_path, app_config, relabel):
+    """Metamorphic: replacing every raw natural id (payload id + source_record_id), either by a
+    permutation of the batch's ids or by ids that DO exist in the canonical table of that entity,
+    leaves the set of (issue type, payload content) findings unchanged: detectors key neither on
+    the id's format nor on "own id absent from canonical"."""
     original: set[tuple[str, str]] = set()
     for s in _open(injected_db.path, tmp_path / "original.db"):
         _detect(s, injected_db.batch_id, app_config)
         original = _findings(s)
-    renumbered: set[tuple[str, str]] = set()
-    for s in _open(injected_db.path, tmp_path / "renumbered.db"):
-        rng = random.Random(20261028)
+    relabelled: set[tuple[str, str]] = set()
+    for s in _open(injected_db.path, tmp_path / "relabelled.db"):
         by_type: dict[str, list[RawIngestionRecord]] = {}
         for r in sorted(_raw(s).values(), key=lambda r: r.raw_record_id):
             by_type.setdefault(r.source_entity_type, []).append(r)
         for entity_type, rows in by_type.items():
-            ids = [r.source_record_id for r in rows]
-            permuted = ids[:]
-            while permuted == ids:
-                rng.shuffle(permuted)
-            for r, new_id in zip(rows, permuted, strict=True):
+            new_ids = relabel(s, entity_type, [r.source_record_id for r in rows])
+            assert new_ids != [r.source_record_id for r in rows]
+            for r, new_id in zip(rows, new_ids, strict=True):
                 r.source_record_id = new_id
                 r.payload = dict(r.payload) | {ID_FIELD[entity_type]: new_id}
         s.commit()
+        if relabel is _canonical_ids:  # every raw natural id now exists in canonical
+            for r in _raw(s).values():
+                model = CANONICAL_PK[r.source_entity_type].class_
+                assert s.get(model, r.source_record_id) is not None
         _detect(s, injected_db.batch_id, app_config)
-        renumbered = _findings(s)
+        relabelled = _findings(s)
     assert len(original) == 25
-    assert renumbered == original
+    assert relabelled == original
+
+
+# --- edge cases on hand-built batches ---------------------------------------------------------
+
+EDGE_BATCH = "BATCH-EDGE"
+
+
+def _add_raw(session: Session, entity_type: str, payloads: list[dict]) -> list[str]:
+    """Insert payloads as a separate raw batch; returns their raw_record_ids."""
+    ids = [f"EDGE-{n:06d}" for n in range(1, len(payloads) + 1)]
+    session.execute(
+        sa.insert(RawIngestionRecord),
+        [
+            {
+                "raw_record_id": raw_id,
+                "batch_id": EDGE_BATCH,
+                "source_entity_type": entity_type,
+                "source_record_id": p.get(ID_FIELD[entity_type]),
+                "payload": p,
+                "received_at": CLOCK,
+            }
+            for raw_id, p in zip(ids, payloads, strict=True)
+        ],
+    )
+    session.commit()
+    return ids
+
+
+def _edge_exceptions(session: Session) -> list[tuple[str, IssueType]]:
+    rows = session.scalars(sa.select(DataException).where(DataException.batch_id == EDGE_BATCH))
+    return sorted((r.raw_record_id, r.issue_type) for r in rows)
+
+
+def _iso(value: datetime) -> str:
+    return ensure_utc(value).isoformat().replace("+00:00", "Z")
+
+
+def _arrived_payload(session: Session, shipment_id: str, at: datetime) -> dict:
+    template = next(
+        r.payload
+        for r in _raw(session).values()
+        if r.source_entity_type == "DELIVERY_EVENT" and r.payload["event_type"] == "ARRIVED"
+    )
+    return dict(template) | {
+        "delivery_event_id": "EVT-EDGE",
+        "shipment_id": shipment_id,
+        "event_timestamp": _iso(at),
+        "recorded_timestamp": _iso(at),
+    }
+
+
+def _shipment_with_one_dispatch(session: Session) -> Shipment:
+    stmt = (
+        sa.select(DeliveryEvent.shipment_id)
+        .where(DeliveryEvent.event_type == DeliveryEventType.DISPATCHED)
+        .group_by(DeliveryEvent.shipment_id)
+        .having(sa.func.count() == 1)
+        .order_by(DeliveryEvent.shipment_id)
+        .limit(1)
+    )
+    return session.get(Shipment, session.scalar(stmt))
+
+
+def test_chronology_uses_canonical_dispatched_event_when_present(session, app_config):
+    shipment = _shipment_with_one_dispatch(session)
+    event = session.scalars(
+        sa.select(DeliveryEvent).where(
+            DeliveryEvent.shipment_id == shipment.shipment_id,
+            DeliveryEvent.event_type == DeliveryEventType.DISPATCHED,
+        )
+    ).one()
+    # the event (not the shipment header) is the reference when it exists: move it 5 days later
+    later = ensure_utc(shipment.dispatch_timestamp) + timedelta(days=5)
+    event.event_timestamp, event.recorded_timestamp = later, later
+    session.commit()
+    between = ensure_utc(shipment.dispatch_timestamp) + timedelta(days=1)
+    (raw_id,) = _add_raw(
+        session, "DELIVERY_EVENT", [_arrived_payload(session, shipment.shipment_id, between)]
+    )
+    _detect(session, EDGE_BATCH, app_config)
+    assert _edge_exceptions(session) == [(raw_id, IssueType.DELIVERY_BEFORE_DISPATCH)]
+    exc = session.scalars(
+        sa.select(DataException).where(DataException.batch_id == EDGE_BATCH)
+    ).one()
+    assert exc.evidence["dispatch_source"] == "delivery_events.DISPATCHED"
+    assert exc.evidence["canonical_dispatched_timestamp"] == _iso(later)
+
+
+def test_chronology_falls_back_to_shipment_dispatch_timestamp(session, app_config):
+    shipment = _shipment_with_one_dispatch(session)
+    session.execute(
+        sa.delete(DeliveryEvent).where(
+            DeliveryEvent.shipment_id == shipment.shipment_id,
+            DeliveryEvent.event_type == DeliveryEventType.DISPATCHED,
+        )
+    )
+    session.commit()
+    dispatch = ensure_utc(shipment.dispatch_timestamp)
+    before, after = dispatch - timedelta(hours=1), dispatch + timedelta(hours=1)
+    early, late = _add_raw(
+        session,
+        "DELIVERY_EVENT",
+        [
+            _arrived_payload(session, shipment.shipment_id, before),
+            _arrived_payload(session, shipment.shipment_id, after),
+        ],
+    )
+    _detect(session, EDGE_BATCH, app_config)
+    assert _edge_exceptions(session) == [(early, IssueType.DELIVERY_BEFORE_DISPATCH)]
+    exc = session.scalars(
+        sa.select(DataException).where(DataException.batch_id == EDGE_BATCH)
+    ).one()
+    assert exc.evidence["dispatch_source"] == "shipments.dispatch_timestamp"
+    assert exc.evidence["canonical_dispatched_timestamp"] == _iso(dispatch)
+    assert exc.related_entity_ids == [shipment.shipment_id]
+    assert late not in {r for r, _ in _edge_exceptions(session)}
+
+
+def test_leakage_reference_entity_type_is_case_insensitive(session, injected_db, app_config):
+    raw_id = sorted(_positives(injected_db.cases, IssueType.SCORE_FUTURE_LEAKAGE))[0]
+    p = dict(session.get(RawIngestionRecord, raw_id).payload)
+    p["evidence_refs"] = [
+        x | {"source_entity_type": x["source_entity_type"].upper()} for x in p["evidence_refs"]
+    ]
+    (edge_id,) = _add_raw(session, "SUPPLIER_SCORE", [p])
+    _detect(session, EDGE_BATCH, app_config)
+    assert _edge_exceptions(session) == [(edge_id, IssueType.SCORE_FUTURE_LEAKAGE)]
+
+
+def test_leakage_payload_with_malformed_cutoff_is_reported_as_skipped(
+    session, injected_db, app_config
+):
+    raw_id = sorted(_positives(injected_db.cases, IssueType.SCORE_FUTURE_LEAKAGE))[0]
+    p = dict(session.get(RawIngestionRecord, raw_id).payload)
+    naive = p | {"data_cutoff_timestamp": p["data_cutoff_timestamp"].removesuffix("Z")}
+    garbage = p | {"data_cutoff_timestamp": "not-a-timestamp"}
+    naive_id, garbage_id = _add_raw(session, "SUPPLIER_SCORE", [naive, garbage])
+    result = _detect(session, EDGE_BATCH, app_config)
+    assert _edge_exceptions(session) == []
+    assert [raw for raw, _ in result.skipped] == [naive_id, garbage_id]
+    assert all("data_cutoff_timestamp" in reason for _, reason in result.skipped)
+
+
+def test_detection_rejects_unknown_or_empty_batch(session, app_config):
+    for batch_id in ("BATCH-NO-SUCH", ""):
+        with pytest.raises(ValueError, match="batch"):
+            _detect(session, batch_id, app_config)
+
+
+def test_record_can_carry_missing_po_and_site_conflict(session, app_config):
+    """One raw record, two defects: its PO does not exist (A) and its site is not effective at
+    dispatch (E). One exception per (raw record, issue type), so it carries both."""
+    template = next(r.payload for r in _raw(session).values() if r.source_entity_type == "SHIPMENT")
+    site = session.get(Site, template["originating_site_id"])
+    dispatch = datetime.combine(site.effective_from, datetime.min.time(), UTC) - timedelta(days=30)
+    payload = dict(template) | {
+        "shipment_id": "SHP-EDGE",
+        "po_id": "PO-2026-999998",
+        "dispatch_timestamp": _iso(dispatch),
+    }
+    assert session.get(PurchaseOrder, payload["po_id"]) is None
+    (raw_id,) = _add_raw(session, "SHIPMENT", [payload])
+    _detect(session, EDGE_BATCH, app_config)
+    assert _edge_exceptions(session) == [
+        (raw_id, IssueType.SHIPMENT_MISSING_PO),
+        (raw_id, IssueType.SITE_ATTRIBUTION_CONFLICT),
+    ]
+    e = session.scalars(
+        sa.select(DataException).where(
+            DataException.batch_id == EDGE_BATCH,
+            DataException.issue_type == IssueType.SITE_ATTRIBUTION_CONFLICT,
+        )
+    ).one()
+    assert e.evidence["conflicts"] == ["site_not_effective_at_dispatch"]
 
 
 def test_detection_sources_have_no_raw_id_literal():

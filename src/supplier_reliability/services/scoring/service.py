@@ -248,7 +248,6 @@ class ScoringService:
         - SUPERSEDED: the current score's fingerprint differs; version + 1 (CORRECTED) supersedes
           it in the schema-enforced order, as `recalculate` does.
         Scores, lineage and snapshot are written by the same `_insert` as every other score."""
-        self._check_version(None)
         self._next_number = None
         ids = self._supplier_ids([supplier_id])
         key = self._keys(ids, window)[supplier_id]
@@ -271,12 +270,8 @@ class ScoringService:
             restated.get(old.restates_score_id or ""),
             corrected,
         )
-        old.is_current = False
-        self.session.flush()
-        (new_id,) = self._insert([new], self.clock())
-        old.superseded_by_score_id = new_id
-        self.session.flush()
-        return new_id, CorrectionOutcome.SUPERSEDED
+        superseded, _ = self._supersede([(old, new)], [])
+        return superseded[old.score_id], CorrectionOutcome.SUPERSEDED
 
     # -- transaction plumbing ------------------------------------------------------------------
 
@@ -406,16 +401,28 @@ class ScoringService:
                     restated.get(old.restates_score_id or ""),
                 )
                 changed.append((old, new))
-        # supersession write order (schema-enforced): demote, insert, link
+        superseded, created = self._supersede(changed, fresh)
+        out.superseded.update(superseded)
+        out.created.extend(created)
+
+    def _supersede(
+        self, changed: list[tuple[SupplierScore, _NewScore]], fresh: list[_NewScore]
+    ) -> tuple[dict[str, str], list[str]]:
+        """Insert each `changed` successor over its old row, plus the `fresh` version-1 rows, in
+        the schema-enforced supersession order: demote the old rows (is_current=False) + flush,
+        insert the new rows + flush, link old.superseded_by_score_id + flush. Returns
+        ({old score_id: new score_id}, ids of the fresh rows). The one place this order lives
+        (used by recalculate and stage_corrected)."""
         for old, _ in changed:
             old.is_current = False
         self.session.flush()
         new_ids = self._insert([new for _, new in changed] + fresh, self.clock())
+        superseded: dict[str, str] = {}
         for (old, _), new_id in zip(changed, new_ids, strict=False):
             old.superseded_by_score_id = new_id
-            out.superseded[old.score_id] = new_id
+            superseded[old.score_id] = new_id
         self.session.flush()
-        out.created.extend(new_ids[len(changed) :])
+        return superseded, new_ids[len(changed) :]
 
     def _by_id(self, score_ids: list[str]) -> dict[str, SupplierScore]:
         if not score_ids:

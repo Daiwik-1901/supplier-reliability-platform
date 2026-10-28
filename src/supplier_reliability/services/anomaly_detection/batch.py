@@ -11,6 +11,10 @@ Idempotency: one exception per (batch_id, raw_record_id, issue_type) (also a uni
 constraint). Pairs that already have an exception are skipped before any correction, so a
 re-run writes nothing. Exception ids EXC-NNNNNN continue from the maximum, assigned in
 (raw_record_id, issue_type) order; detected_at comes from the injected `clock` (called once).
+
+An unknown or empty batch_id (no raw records) raises ValueError. SUPPLIER_SCORE records whose
+cutoff is unusable are listed in DetectionResult.skipped as (raw_record_id, reason) and get no
+exception (malformed payloads belong to validate_payload / run_validation).
 """
 
 from collections import Counter
@@ -35,6 +39,7 @@ from supplier_reliability.services.anomaly_detection.detectors import (
 from supplier_reliability.services.anomaly_detection.detectors_leakage import (
     correct_leakage,
     detect_score_leakage,
+    skipped_score_payloads,
 )
 from supplier_reliability.services.scoring.service import ScoringService
 
@@ -52,6 +57,7 @@ class DetectionResult:
     exceptions: list[str]  # ids of the exceptions created by this run
     by_issue_type: dict[str, int]  # new exceptions per issue type (every type, zeros included)
     corrected_scores: list[str]  # distinct corrected_score_ids of this run's exceptions
+    skipped: list[tuple[str, str]]  # (raw_record_id, reason): records no detector could judge
 
 
 def detect_raw_batch(
@@ -68,6 +74,12 @@ def detect_raw_batch(
         )
     if scoring.session is not session:
         raise ValueError("the scoring service must use the detection session")
+    if not batch_id or not session.scalar(
+        sa.select(sa.func.count())
+        .select_from(RawIngestionRecord)
+        .where(RawIngestionRecord.batch_id == batch_id)
+    ):
+        raise ValueError(f"unknown or empty raw batch {batch_id!r}")
     detected_at = ensure_utc(clock())
     try:
         records = list(
@@ -93,6 +105,7 @@ def detect_raw_batch(
                 for exception_id, h in zip(ids, new, strict=True)
             ],
         )
+        skipped = skipped_score_payloads(records)
         session.commit()
     except BaseException:
         session.rollback()
@@ -103,6 +116,7 @@ def detect_raw_batch(
         exceptions=ids,
         by_issue_type={i.value: counts.get(i.value, 0) for i in IssueType},
         corrected_scores=list(dict.fromkeys(corrected)),
+        skipped=skipped,
     )
 
 
