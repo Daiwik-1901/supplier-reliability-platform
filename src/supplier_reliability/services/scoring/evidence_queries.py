@@ -17,6 +17,7 @@ from supplier_reliability.domain.enums import (
     ContractStatus,
     DeliveryEventType,
     DetectionStatus,
+    Disposition,
     POStatus,
     Severity,
 )
@@ -59,13 +60,15 @@ def existing_supplier_ids(session: Session, ids: Ids) -> list[str]:
 
 
 def shipments(session: Session, ids: Ids, start: datetime, end: datetime) -> Sequence[Row]:
-    """Shipments with expected delivery in [start, end] (due and not-yet-due alike)."""
+    """Shipments with expected delivery in [start, end] (due and not-yet-due alike, any
+    created_at: rows created after the cutoff are reported as excluded)."""
     stmt = (
         sa.select(
             Shipment.shipment_id,
             PurchaseOrder.supplier_id,
             Shipment.expected_delivery_timestamp,
             Shipment.shipment_status,
+            Shipment.created_at,
         )
         .join(PurchaseOrder, PurchaseOrder.po_id == Shipment.po_id)
         .where(
@@ -248,12 +251,14 @@ def risk_signals(session: Session, ids: Ids, start: datetime, cutoff: datetime) 
 
 
 def open_critical_exceptions(session: Session, ids: Ids) -> Sequence[Row]:
-    """CRITICAL, non-DISMISSED data exceptions linked to a supplier (any detection time)."""
+    """CRITICAL data exceptions linked to a supplier that are neither DISMISSED (detection
+    status) nor CORRECTED (disposition), at any detection time (ruling R17)."""
     de = DataException
     stmt = sa.select(de.exception_id, de.supplier_id).where(
         de.supplier_id.is_not(None),
         _of(de.supplier_id, ids),
         de.severity == Severity.CRITICAL,
         de.detection_status != DetectionStatus.DISMISSED,
+        sa.or_(de.disposition.is_(None), de.disposition != Disposition.CORRECTED),
     )
     return session.execute(stmt).all()

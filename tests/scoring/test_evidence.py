@@ -14,7 +14,9 @@ from supplier_reliability.domain.enums import (
     ComponentName,
     DeliveryEventType,
     DetectionStatus,
+    Disposition,
     InspectionKind,
+    IssueType,
     POStatus,
     RequirementScope,
     ResolutionStatus,
@@ -127,7 +129,7 @@ def test_quarter_windows_cover_reference_period():
 def test_shipment_not_yet_due_excluded(graph, db_session):
     sup = graph.supplier_graph()
     due = _shipment(graph, sup, utc(2025, 2, 1))
-    later = _shipment(graph, sup, utc(2025, 3, 1))
+    later = _shipment(graph, sup, utc(2025, 3, 1), dispatch=utc(2025, 2, 10))  # known at C
     b = one(db_session, sup.supplier_id, q1(cutoff=utc(2025, 2, 15)))
     assert [d.shipment_id for d in b.deliveries] == [due]
     assert (later, "delivery", "not_yet_due") in _excluded(b)
@@ -205,6 +207,94 @@ def test_shipment_row_actual_delivery_is_ignored(graph, db_session):
     db_session.get(Shipment, shp).actual_delivery_timestamp = utc(2025, 2, 1, 3)
     db_session.flush()
     assert one(db_session, sup.supplier_id).deliveries[0].arrived_known is None
+
+
+def test_shipment_recorded_after_cutoff_is_not_a_delivery(graph, db_session):
+    sup = graph.supplier_graph()
+    c = utc(2025, 2, 15)
+    shp = _shipment(graph, sup, utc(2025, 2, 1), created_at=c + timedelta(days=1))
+    b = one(db_session, sup.supplier_id, q1(cutoff=c))
+    assert b.deliveries == []
+    assert (shp, "delivery", "shipment_recorded_after_cutoff") in _excluded(b)
+    later = one(db_session, sup.supplier_id, q1(cutoff=c + timedelta(days=2)))
+    assert [d.shipment_id for d in later.deliveries] == [shp]
+
+
+@pytest.mark.parametrize("bad_value", ["not-a-date", "2025-02-03T00:00:00", None])
+def test_unparseable_correction_is_ignored_and_listed(graph, db_session, bad_value):
+    sup = graph.supplier_graph()
+    other = graph.supplier_graph()
+    shp = _shipment(graph, sup, utc(2025, 2, 1))
+    ev = graph.event(shipment_id=shp, event_type=ARRIVED, event_timestamp=utc(2025, 2, 1, 6))
+    bad = graph.event(shipment_id=shp, event_type=DeliveryEventType.CORRECTION,
+                      event_timestamp=utc(2025, 2, 5),
+                      metadata={"corrects_event_id": ev, "field": "event_timestamp",
+                                "corrected_value": bad_value})  # fmt: skip
+    _shipment(graph, other, utc(2025, 2, 2))
+    result = collect(db_session, [sup.supplier_id, other.supplier_id], q1())
+    b = result[sup.supplier_id]
+    assert b.deliveries[0].arrived_known == utc(2025, 2, 1, 6)
+    assert (bad, "delivery", "correction_unparseable") in _excluded(b)
+    assert len(result[other.supplier_id].deliveries) == 1  # the batch was not aborted
+
+
+def _boundary_case(graph, db_session, case: str) -> None:
+    sup = graph.supplier_graph()
+    if case == "arrival_recorded_at_cutoff":
+        c = utc(2025, 2, 10)
+        shp = _shipment(graph, sup, utc(2025, 2, 1))
+        graph.event(shipment_id=shp, event_type=ARRIVED, event_timestamp=utc(2025, 2, 9),
+                    recorded_timestamp=c)  # fmt: skip
+        assert one(db_session, sup.supplier_id, q1(c)).deliveries[0].arrived_known == utc(
+            2025, 2, 9
+        )
+    elif case == "inspection_recorded_at_cutoff":
+        c = utc(2025, 2, 10)
+        ins = graph.inspection(shipment_line_id=_line(graph, sup),
+                               inspection_timestamp=utc(2025, 2, 9), recorded_at=c)  # fmt: skip
+        assert [i.inspection_id for i in one(db_session, sup.supplier_id, q1(c)).inspections] == [
+            ins
+        ]
+    elif case == "invoice_recorded_at_cutoff":
+        c = utc(2025, 2, 10, 12)
+        shp = _shipment(graph, sup, utc(2025, 2, 1))
+        inv = graph.invoice(shipment_id=shp, invoice_date=date(2025, 2, 10), recorded_at=c)
+        assert [i.invoice_id for i in one(db_session, sup.supplier_id, q1(c)).invoices] == [inv]
+    elif case == "expected_at_window_start":
+        shp = _shipment(graph, sup, S)
+        assert [d.shipment_id for d in one(db_session, sup.supplier_id).deliveries] == [shp]
+    elif case in ("correction_of_non_arrived_event", "correction_of_other_field"):
+        shp = _shipment(graph, sup, utc(2025, 2, 1))
+        dispatched = graph.event(shipment_id=shp, event_type=DeliveryEventType.DISPATCHED,
+                                 event_timestamp=utc(2025, 1, 27))  # fmt: skip
+        ev = graph.event(shipment_id=shp, event_type=ARRIVED, event_timestamp=utc(2025, 2, 1, 6))
+        target, fld = (
+            (dispatched, "event_timestamp")
+            if case == "correction_of_non_arrived_event"
+            else (ev, "location_id")
+        )
+        graph.event(shipment_id=shp, event_type=DeliveryEventType.CORRECTION,
+                    event_timestamp=utc(2025, 2, 5),
+                    metadata={"corrects_event_id": target, "field": fld,
+                              "corrected_value": utc(2025, 2, 20).isoformat()})  # fmt: skip
+        assert one(db_session, sup.supplier_id).deliveries[0].arrived_known == utc(2025, 2, 1, 6)
+    else:  # pragma: no cover
+        raise AssertionError(case)
+
+
+@pytest.mark.parametrize(
+    "case",
+    [
+        "arrival_recorded_at_cutoff",
+        "inspection_recorded_at_cutoff",
+        "invoice_recorded_at_cutoff",
+        "expected_at_window_start",
+        "correction_of_non_arrived_event",
+        "correction_of_other_field",
+    ],
+)
+def test_eligibility_boundaries(graph, db_session, case):
+    _boundary_case(graph, db_session, case)
 
 
 # --- quality --------------------------------------------------------------------------------
@@ -325,7 +415,11 @@ def test_capacity_site_declarations_override_supplier_wide(graph, db_session):
     assert sum(c.available - c.committed for c in jan_rows) == Decimal("150")  # 100 + 50
     assert {c.capacity_declaration_id: c.verified for c in jan_rows} == {a: True, b_: False}
     assert [c.capacity_declaration_id for c in b.capacities if c.month == feb] == [wide_feb]
-    assert (wide_jan, "capacity", "capacity_scope_overridden") in _excluded(b)
+    assert (
+        ExcludedRecord("capacity_declaration", wide_jan, ComponentName.capacity,
+                       "capacity_scope_overridden", month=jan)
+        in b.excluded
+    )  # fmt: skip
     assert all(isinstance(c, CapacityObs) for c in b.capacities)
 
 
@@ -463,7 +557,9 @@ def test_risk_obs_fields_resolution_and_site_activity(graph, db_session):
                                               q1(cutoff=utc(2025, 3, 1))).risks}  # fmt: skip
     assert obs[resolved].resolved_at_cutoff is True
     assert obs[later].resolved_at_cutoff is False  # RESOLVED only from 2025-03-20 (R14)
-    assert obs[later].resolution == ResolutionStatus.RESOLVED
+    # resolution is as of C: stored RESOLVED with valid_to after C was still OPEN at C
+    assert obs[later].resolution == ResolutionStatus.OPEN
+    assert obs[resolved].resolution == ResolutionStatus.RESOLVED
     assert obs[resolved].site_active is True
     assert obs[later].site_active is False
     assert obs[attest].site_id is None and obs[attest].site_active is True
@@ -484,14 +580,19 @@ def test_open_critical_exceptions(graph, db_session):
     crit = graph.data_exception(supplier_id=sup.supplier_id, detected_at=utc(2026, 1, 1))
     graph.data_exception(supplier_id=sup.supplier_id, severity=Severity.HIGH)
     graph.data_exception(supplier_id=sup.supplier_id, detection_status=DetectionStatus.DISMISSED)
+    graph.data_exception(supplier_id=sup.supplier_id, disposition=Disposition.CORRECTED,
+                         issue_type=IssueType.SCORE_FUTURE_LEAKAGE)  # fmt: skip
+    no_disposition = graph.data_exception(supplier_id=sup.supplier_id, disposition=None,
+                                          detection_status=DetectionStatus.CONFIRMED)  # fmt: skip
     graph.data_exception(supplier_id=other.supplier_id)
-    assert one(db_session, sup.supplier_id).open_critical_exception_ids == [crit]
+    ids = one(db_session, sup.supplier_id).open_critical_exception_ids
+    assert ids == sorted([crit, no_disposition])  # CORRECTED and DISMISSED are not open
 
 
 def test_excluded_records_listed_with_reason(graph, db_session):
     sup = graph.supplier_graph()
     c = utc(2025, 2, 15)
-    not_due = _shipment(graph, sup, utc(2025, 3, 1))
+    not_due = _shipment(graph, sup, utc(2025, 3, 1), dispatch=utc(2025, 2, 10))
     due = _shipment(graph, sup, utc(2025, 2, 1))
     ev = graph.event(shipment_id=due, event_type=ARRIVED, event_timestamp=utc(2025, 2, 14),
                      recorded_timestamp=utc(2025, 2, 16))  # fmt: skip

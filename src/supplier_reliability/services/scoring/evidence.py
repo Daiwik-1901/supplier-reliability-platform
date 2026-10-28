@@ -3,25 +3,35 @@
 Eligibility (D5): a record counts only if its occurrence time is in [S, min(E, C)] and its
 recording time is <= C. Interpretations fixed here (documented, tested):
 
-- Delivery (D4, D13, R12): due = expected_delivery_timestamp in [S, min(E, C)]; CANCELLED
-  shipments are excluded ("cancelled"); shipments expected in (min(E, C), E] are "not_yet_due".
+- Delivery (D4, D13, R12): due = expected_delivery_timestamp in [S, min(E, C)]. Shipments
+  created after C do not exist at C ("shipment_recorded_after_cutoff"); CANCELLED shipments
+  are excluded ("cancelled"); shipments expected in (min(E, C), E] are "not_yet_due".
   The arrival known at C is derived from DeliveryEvent rows only (never
   Shipment.actual_delivery_timestamp): the ARRIVED event with event_timestamp <= C and
   recorded_timestamp <= C (the first recorded, if several), its timestamp replaced by the
-  corrected_value of the latest CORRECTION (recorded <= C) whose corrects_event_id names it.
-  If that correction moves the arrival after C, the arrival is unknown at C (overdue). ARRIVED
-  and CORRECTION events of due shipments with event_timestamp <= C but recorded after C are
-  listed as excluded ("recorded_after_cutoff").
+  corrected_value of the latest CORRECTION (recorded <= C) whose corrects_event_id names that
+  ARRIVED event and whose field is "event_timestamp" (corrections of other events or fields
+  are ignored). A correction whose corrected_value is missing, unparseable or naive is ignored
+  and listed ("correction_unparseable"); the previous valid correction, if any, applies.
+  If the applied correction moves the arrival after C, the arrival is unknown at C (overdue).
+  ARRIVED and CORRECTION events of due shipments with event_timestamp <= C but recorded after
+  C are listed as excluded ("recorded_after_cutoff").
 - Quality (D2): inspections with inspection_timestamp in [S, min(E, C)] and recorded_at <= C,
   reduced to the latest per shipment_line by (inspection_timestamp, inspection_id).
-- Cost: invoice_date is a DATE, so it is compared with the dates of S and min(E, C);
-  recorded_at <= C is still required.
-- Demand (D12): lines of non-CANCELLED POs with order_date (a DATE) in [date(S),
-  date(min(E, C))], PO and line created_at <= C; month = first day of the order month.
+- DATE columns (invoice_date, order_date) have day granularity: they are compared with the UTC
+  calendar dates date(S) and date(min(E, C)), inclusive. Consequence for a mid-day window
+  bound: a record dated on the day of S counts even if it "happened" before S's time of day,
+  and one dated on the day of min(E, C) counts even if after that time of day. The
+  recording-time rule (recorded_at / created_at <= C) is still applied at full precision, so
+  nothing recorded after C ever leaks in. Quarter windows (midnight to 23:59:59) are unaffected.
+- Cost: invoices with invoice_date in the date window and recorded_at <= C.
+- Demand (D12): lines of non-CANCELLED POs with order_date in the date window, PO and line
+  created_at <= C; month = first day of the order month.
 - Capacity (D12): declarations recorded <= C overlapping the window's months, one CapacityObs
   per declaration per covered window month. Per supplier and month, site-level rows (any
-  verification status) override supplier-wide rows ("capacity_scope_overridden"). UNVERIFIED
-  rows are kept with verified=False; the component decides.
+  verification status) override supplier-wide rows: each overridden row is listed once per
+  month ("capacity_scope_overridden", ExcludedRecord.month set). UNVERIFIED rows are kept with
+  verified=False; the component decides.
 - Compliance (D11): requirements with effective_from <= date(C) <= effective_to (or open) and
   created_at <= C, on non-DRAFT contracts effective at date(C). The current certification per
   (supplier, type, site-or-None) is the latest row recorded <= C (by recorded_at, then id) not
@@ -32,10 +42,13 @@ recording time is <= C. Interpretations fixed here (documented, tested):
   signals observed inside [S, C - lookback) are listed "signal_outside_lookback".
   site_active = the site's effective period contains date(C) (an open-ended period also
   requires site_status ACTIVE); True when site_id is NULL. resolved_at_cutoff = RESOLVED and
-  valid_to <= C. Quarantined signals never reach canonical tables, so nothing to filter.
-- open_critical_exception_ids: CRITICAL data_exceptions linked to the supplier whose
-  detection_status is not DISMISSED, regardless of C (detected_at is processing time; they flag
-  data trust for the supplier).
+  valid_to <= C. `resolution` is the status AS OF C, not the stored (current) one: RESOLVED iff
+  resolved_at_cutoff; only the final status is stored, so a stored RESOLVED whose valid_to is
+  after C (or NULL) was still open at C and maps to OPEN; OPEN/MITIGATING are kept.
+  Quarantined signals never reach canonical tables, so nothing to filter.
+- open_critical_exception_ids (R17): CRITICAL data_exceptions linked to the supplier whose
+  detection_status is not DISMISSED and whose disposition is not CORRECTED, regardless of C
+  (detected_at is processing time; they flag data trust for the supplier).
 """
 
 from collections import defaultdict
@@ -178,6 +191,7 @@ class ExcludedRecord:
     source_record_id: str
     component: ComponentName
     reason: str
+    month: date | None = None  # set for per-month exclusions (capacity scope rule)
 
 
 @dataclass(frozen=True)
@@ -249,31 +263,49 @@ def _bundle(sid: str, window: EvaluationWindow, lists: _Lists) -> EvidenceBundle
         risks=by(lambda o: o.risk_signal_id, "risks"),
         excluded=sorted(
             set(lists["excluded"]),
-            key=lambda x: (x.component, x.source_entity_type, x.source_record_id, x.reason),
+            key=lambda x: (
+                x.component,
+                x.source_entity_type,
+                x.source_record_id,
+                x.reason,
+                x.month or date.min,
+            ),
         ),
         open_critical_exception_ids=sorted(lists["open_critical_exception_ids"]),
     )
 
 
-def _exclude(acc: _Lists, entity: str, record_id: str, component: ComponentName, reason: str):
-    acc["excluded"].append(ExcludedRecord(entity, record_id, component, reason))
+def _exclude(
+    acc: _Lists,
+    entity: str,
+    record_id: str,
+    component: ComponentName,
+    reason: str,
+    month: date | None = None,
+) -> None:
+    acc["excluded"].append(ExcludedRecord(entity, record_id, component, reason, month))
 
 
 def _deliveries(session: Session, ids, w: EvaluationWindow, acc: dict[str, _Lists]) -> None:
     c, top = w.cutoff, w.occurrence_end
     due: dict[str, tuple[str, datetime]] = {}  # shipment_id -> (supplier_id, expected)
     for r in q.shipments(session, ids, w.start, w.end):
-        if r.shipment_status == ShipmentStatus.CANCELLED:
-            _exclude(acc[r.supplier_id], "shipment", r.shipment_id, _C.delivery, "cancelled")
+        reason = None
+        if r.created_at > c:
+            reason = "shipment_recorded_after_cutoff"
+        elif r.shipment_status == ShipmentStatus.CANCELLED:
+            reason = "cancelled"
         elif r.expected_delivery_timestamp > top:
-            _exclude(acc[r.supplier_id], "shipment", r.shipment_id, _C.delivery, "not_yet_due")
+            reason = "not_yet_due"
+        if reason:
+            _exclude(acc[r.supplier_id], "shipment", r.shipment_id, _C.delivery, reason)
         else:
             due[r.shipment_id] = (r.supplier_id, r.expected_delivery_timestamp)
 
     events: dict[str, list[Any]] = defaultdict(list)
     for e in q.arrival_events(session, ids, w.start, top):
         if e.shipment_id not in due:
-            continue  # cancelled
+            continue  # cancelled or not known at C
         if e.recorded_timestamp <= c:
             events[e.shipment_id].append(e)
         elif e.event_timestamp <= c:  # happened by C, but not known at C
@@ -282,12 +314,24 @@ def _deliveries(session: Session, ids, w: EvaluationWindow, acc: dict[str, _List
                      "recorded_after_cutoff")  # fmt: skip
 
     for shipment_id, (sup, expected) in due.items():
-        arrived = _known_arrival(events.get(shipment_id, []), c)
+        arrived, unparseable = _known_arrival(events.get(shipment_id, []), c)
         acc[sup]["deliveries"].append(DeliveryObs(shipment_id, expected, arrived))
+        for event_id in unparseable:
+            _exclude(acc[sup], "delivery_event", event_id, _C.delivery, "correction_unparseable")
 
 
-def _known_arrival(events: list[Any], cutoff: datetime) -> datetime | None:
-    """R12: effective ARRIVED timestamp at the cutoff from events all recorded <= cutoff."""
+def _corrected_value(event: Any) -> datetime | None:
+    """The correction's corrected_value as aware UTC, or None if missing/unparseable/naive."""
+    value = (event.event_metadata or {}).get("corrected_value")
+    try:
+        return ensure_utc(datetime.fromisoformat(value))
+    except (TypeError, ValueError):
+        return None
+
+
+def _known_arrival(events: list[Any], cutoff: datetime) -> tuple[datetime | None, list[str]]:
+    """R12: (effective ARRIVED timestamp at the cutoff or None, ids of unparseable corrections
+    of that arrival) from events all recorded <= cutoff."""
     key = lambda e: (e.recorded_timestamp, e.delivery_event_id)  # noqa: E731
     arrivals = sorted(
         (
@@ -298,22 +342,23 @@ def _known_arrival(events: list[Any], cutoff: datetime) -> datetime | None:
         key=key,
     )
     if not arrivals:
-        return None
+        return None, []
     arrived = arrivals[0]
-    corrections = sorted(
-        (
-            e
-            for e in events
-            if e.event_type == DeliveryEventType.CORRECTION
-            and (e.event_metadata or {}).get("corrects_event_id") == arrived.delivery_event_id
-            and (e.event_metadata or {}).get("field") == "event_timestamp"
-        ),
-        key=key,
-    )
-    when = arrived.event_timestamp
-    if corrections:
-        when = ensure_utc(datetime.fromisoformat(corrections[-1].event_metadata["corrected_value"]))
-    return when if when <= cutoff else None
+    when, unparseable = arrived.event_timestamp, []
+    for e in sorted(events, key=key):
+        meta = e.event_metadata or {}
+        if (
+            e.event_type != DeliveryEventType.CORRECTION
+            or meta.get("corrects_event_id") != arrived.delivery_event_id
+            or meta.get("field") != "event_timestamp"
+        ):
+            continue
+        value = _corrected_value(e)
+        if value is None:
+            unparseable.append(e.delivery_event_id)
+        else:
+            when = value  # the latest valid correction wins
+    return (when if when <= cutoff else None), unparseable
 
 
 def _inspections(session: Session, ids, w: EvaluationWindow, acc: dict[str, _Lists]) -> None:
@@ -391,12 +436,12 @@ def _capacities(session: Session, ids, w: EvaluationWindow, acc: dict[str, _List
                     r.verification_status == CapacityVerification.VERIFIED,
                 )
                 cells[(r.supplier_id, month)]["site" if r.site_id else "wide"].append(obs)
-    for (sup, _month), cell in cells.items():
+    for (sup, month), cell in cells.items():
         if cell["site"]:
             acc[sup]["capacities"].extend(cell["site"])
             for obs in cell["wide"]:
                 _exclude(acc[sup], "capacity_declaration", obs.capacity_declaration_id,
-                         _C.capacity, "capacity_scope_overridden")  # fmt: skip
+                         _C.capacity, "capacity_scope_overridden", month)  # fmt: skip
         else:
             acc[sup]["capacities"].extend(cell["wide"])
 
@@ -480,6 +525,12 @@ def _risks(
             and r.valid_to is not None
             and r.valid_to <= c
         )
+        if resolved:
+            resolution = ResolutionStatus.RESOLVED
+        elif r.resolution_status == ResolutionStatus.RESOLVED:
+            resolution = ResolutionStatus.OPEN  # resolved only after C: still open at C
+        else:
+            resolution = r.resolution_status
         sup["risks"].append(
             RiskObs(
                 r.risk_signal_id,
@@ -488,7 +539,7 @@ def _risks(
                 r.signal_type,
                 r.severity,
                 r.observed_timestamp,
-                r.resolution_status,
+                resolution,
                 r.dedup_key,
                 resolved,
             )
