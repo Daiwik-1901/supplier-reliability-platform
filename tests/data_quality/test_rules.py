@@ -344,23 +344,35 @@ def test_dc008_unit_of_measure_mismatches(db_session, graph):
     assert fired_on(db_session, "DC-008") == {graph.allocation, graph.capacity}
 
 
-def test_dc009_one_low_finding_per_contract_over_capacity(db_session, graph):
-    """Ruling R32: one finding per contract, summarising the months that exceeded."""
-    a, g = graph.a, graph.g
-    for day, qty in ((date(2025, 1, 20), "20000"), (date(2025, 2, 3), "100")):
-        po = g.purchase_order(supplier_id=a.supplier_id, contract_id=a.contract_id, order_date=day)
-        g.po_line(po_id=po, ordered_quantity=qty)
-    for day in (date(2025, 3, 3), date(2025, 3, 20)):  # March: 2 x 6000 = 12000 > 10000
-        po = g.purchase_order(supplier_id=a.supplier_id, contract_id=a.contract_id, order_date=day)
-        g.po_line(po_id=po, ordered_quantity="6000")
+def _order(graph: Graph, day: date, qty: str) -> None:
+    a = graph.a
+    po = graph.g.purchase_order(
+        supplier_id=a.supplier_id, contract_id=a.contract_id, order_date=day
+    )
+    graph.g.po_line(po_id=po, ordered_quantity=qty)
+
+
+def test_dc009_two_months_over_is_not_flagged(db_session, graph):
+    """Ruling R34: single spikes are normal lumpy demand; only >= 3 months over is flagged."""
+    _order(graph, date(2025, 1, 20), "20000")  # January 20100 / 10000
+    _order(graph, date(2025, 2, 3), "100")  # February within capacity
+    _order(graph, date(2025, 3, 3), "12000")  # March over
     result = run_validation(db_session, ["DC-009"], persist=False, clock=lambda: NOW)
-    found = result.findings
+    assert result.findings == []
+    assert result.checked_counts_by_rule["DC-009"] == 1  # the contract was still evaluated
+
+
+def test_dc009_three_months_over_is_one_low_finding_per_contract(db_session, graph):
+    """Rulings R32/R34: one finding per contract, summarising the months that exceeded."""
+    _order(graph, date(2025, 1, 20), "20000")  # January 20100 / 10000 = 2.01, the worst month
+    _order(graph, date(2025, 2, 3), "100")  # February within capacity
+    _order(graph, date(2025, 3, 3), "12000")
+    _order(graph, date(2025, 4, 3), "10001")
+    found = check(db_session, "DC-009")
     assert [(f.entity_id, f.field, f.severity) for f in found] == [
-        (a.contract_id, "contracted_capacity", Severity.LOW)
+        (graph.a.contract_id, "contracted_capacity", Severity.LOW)
     ]
-    # January 20100 / 10000 = 2.01 is the worst month; February (100) is within capacity
-    assert found[0].observed_value == "2/3 months, max ratio 2.01"
-    assert result.checked_counts_by_rule["DC-009"] == 1  # contracts evaluated
+    assert found[0].observed_value == "3/4 months, max ratio 2.01"
 
 
 def test_dc010_verified_capacity_committed_above_available(db_session, graph):

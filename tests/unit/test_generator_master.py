@@ -1,6 +1,6 @@
 from collections import defaultdict
 from datetime import UTC, date, datetime
-from decimal import Decimal
+from decimal import ROUND_HALF_UP, Decimal
 
 import pytest
 import sqlalchemy as sa
@@ -134,6 +134,28 @@ def test_some_contracts_have_unknown_capacity(starter):
         if c["contracted_capacity"] is not None:
             assert isinstance(c["contracted_capacity"], Decimal)
             assert c["contracted_capacity"] >= 0
+
+
+def test_contracted_capacity_is_profile_free_capacity_with_peak_headroom(starter):
+    """Rulings R33/R34: expected demand / profile demand_capacity_ratio x CONTRACT_PEAK_HEADROOM."""
+    from supplier_reliability.services.generator.constants import CONTRACT_PEAK_HEADROOM
+
+    assert Decimal("2.0") == CONTRACT_PEAK_HEADROOM
+    cfg, ds = starter
+    total_w = sum(cfg.profiles[p].po_weight for p in ds.supplier_profiles.values())
+    checked = 0
+    for c in ds.contracts:
+        if c["contracted_capacity"] is None:
+            continue
+        p = cfg.profiles[ds.supplier_profiles[c["supplier_id"]]]
+        demand = expected_monthly_demand(p, cfg.n_purchase_orders * p.po_weight / total_w, cfg)
+        ratio = Decimal(str(p.demand_capacity_ratio))
+        expected = (demand / ratio * CONTRACT_PEAK_HEADROOM).quantize(
+            Decimal("0.01"), ROUND_HALF_UP
+        )
+        assert c["contracted_capacity"] == expected, c["contract_id"]
+        checked += 1
+    assert checked >= 0.85 * len(ds.contracts)
 
 
 def test_each_contract_has_price_per_category(starter):

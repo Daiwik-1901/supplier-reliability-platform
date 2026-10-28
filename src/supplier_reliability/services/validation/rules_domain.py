@@ -40,6 +40,11 @@ from supplier_reliability.services.validation.rules_integrity import (
 )
 
 CAPACITY_UNIT = "units/month"
+DC009_MIN_MONTHS_OVER = 3
+"""DC-009 flags a contract only when its monthly demand exceeded contracted_capacity in at least
+this many evaluated months (Ruling R34). Demand per contract-month is lumpy (a few POs of 1-5
+lines each), so a single-month spike above the ceiling is normal; sustained excess is the
+signal."""
 _HIGH = {"category": "domain", "severity": Severity.HIGH}
 _MEDIUM = {"category": "domain", "severity": Severity.MEDIUM}
 
@@ -389,10 +394,11 @@ def dc_008(session: Session) -> RuleCheck:
     category="domain",
     severity=Severity.LOW,
     description=(
-        "Informational (D12, Ruling R32): ONE finding per contract whose monthly demand (sum "
-        "of ordered quantity of non-cancelled POs ordered that month) exceeded its "
-        "contracted_capacity in any month; observed = '{months exceeded}/{months with demand} "
-        "months, max ratio {worst demand / capacity, 2 dp}'. checked = contracts evaluated "
+        "Informational (D12, Rulings R32/R34): ONE finding per contract whose monthly demand "
+        "(sum of ordered quantity of non-cancelled POs ordered that month) exceeded its "
+        "contracted_capacity in at least DC009_MIN_MONTHS_OVER (3) months; observed = "
+        "'{months exceeded}/{months with demand} months, max ratio {worst demand / capacity, "
+        "2 dp}'. checked = contracts evaluated "
         "(non-null capacity, at least one month with demand). The capacity score uses verified "
         "capacity instead, so this is LOW."
     ),
@@ -424,7 +430,7 @@ def dc_009(session: Session) -> RuleCheck:
     for contract_id, totals in sorted(months.items()):
         ceiling = capacity[contract_id]
         over = [t for t in totals if t > ceiling]
-        if not over:
+        if len(over) < DC009_MIN_MONTHS_OVER:
             continue
         worst = (
             "inf"

@@ -28,6 +28,7 @@ from supplier_reliability.domain.enums import (
 from supplier_reliability.domain.numeric import to_money
 from supplier_reliability.services.generator.config import GeneratorCapacityError, GeneratorConfig
 from supplier_reliability.services.generator.constants import (
+    CONTRACT_PEAK_HEADROOM,
     CURRENCY_FACTOR,
     MEAN_LINES_PER_PO,
     MEAN_QTY_PER_LINE,
@@ -127,7 +128,15 @@ def generate_master_data(
         )
         for s, p in zip(ds.suppliers, profiles, strict=True)
     }
-    _gen_contracts(rs, ids, ds, demand, ref_start, ref_end)
+    ceilings = {
+        sid: _dec(
+            demand[sid]
+            / _d(cfg.profiles[ds.supplier_profiles[sid]].demand_capacity_ratio)
+            * CONTRACT_PEAK_HEADROOM
+        )
+        for sid in demand
+    }
+    _gen_contracts(rs, ids, ds, ceilings, ref_start, ref_end)
     _gen_prices(rs, ids, ds)
     _gen_requirements(rs, ids, ds, ref_start)
     _gen_certifications(cfg, rs, ids, ds, ref_start)
@@ -222,7 +231,7 @@ def _gen_contracts(
     rs: RandomSource,
     ids: IdRegistry,
     ds: GeneratedDataset,
-    demand: dict[str, Decimal],
+    ceilings: dict[str, Decimal],
     ref_start: date,
     ref_end: date,
 ) -> None:
@@ -261,7 +270,11 @@ def _gen_contracts(
         for eff_from, eff_to, status in spans:
             created = _utc(eff_from, 10) - timedelta(days=int(rng.integers(1, 30)))
             created = max(created, _utc(sup["onboarding_date"], 10))
-            ceiling = max(Decimal(50), demand[sid] * _d(round(float(rng.uniform(1.3, 2.2)), 4)))
+            # Ruling R33: the ceiling is deterministic (see CONTRACT_PEAK_HEADROOM). The former
+            # random multiplier is still drawn so the "contracts" stream, and with it every
+            # other contract attribute (dates, terms, NULL-capacity picks), stays unchanged.
+            rng.uniform(1.3, 2.2)
+            ceiling = ceilings[sid]
             rows.append(
                 {
                     "contract_id": ids.next("contract"),
@@ -273,7 +286,7 @@ def _gen_contracts(
                     "currency": currency,
                     "payment_terms": pay,
                     "delivery_terms": delivery,
-                    "contracted_capacity": _dec(ceiling),
+                    "contracted_capacity": ceiling,
                     "capacity_unit": "units/month",
                     "created_at": created,
                 }

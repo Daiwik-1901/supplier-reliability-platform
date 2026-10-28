@@ -49,5 +49,15 @@ PRODUCT_CATEGORIES: dict[SupplierCategory, tuple[tuple[str, str, float], ...]] =
     ),
 }
 
+CONTRACT_PEAK_HEADROOM = Decimal("2.0")
+"""Contractual monthly ceiling over the supplier's expected free capacity (Rulings R33, R34):
+``contracted_capacity = expected_monthly_demand / profile.demand_capacity_ratio x headroom``.
+Expected demand / ratio is the free capacity the supplier is sized for, so the ceiling scales
+with how comfortable the profile is: suppliers with spare capacity (low demand/capacity ratio)
+rarely exceed their contractual ceiling for a sustained period, while capacity_constrained ones
+(ratio > 1) regularly do. Together with DC-009's minimum of 3 months over, this makes rule DC-009
+a signal rather than noise (measured on the full preset: stable_high ~6% of contracts flagged,
+capacity_constrained ~78%)."""
+
 CURRENCY_FACTOR: dict[str, float] = {"USD": 1.0, "EUR": 0.92, "GBP": 0.79, "INR": 83.0}
 """Multiplier applied to the USD base price to get the contract-currency price (synthetic)."""
