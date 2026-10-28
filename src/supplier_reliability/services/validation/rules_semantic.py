@@ -159,8 +159,9 @@ def se_003(session: Session) -> RuleCheck:
     description=(
         "Join multiplication: per PO, the sum of its invoices' expected_amount equals the sum, "
         "over the distinct invoiced shipments of the PO, of to_money(received x agreed price) "
-        "computed independently at the allocation grain (D1, D3). A shipment invoiced twice or "
-        "an invoice attached to the wrong PO shows up here. Decimal in Python. HIGH."
+        "computed independently at the allocation grain (D1, D3). A shipment invoiced twice "
+        "(the expected value counted once per invoice) shows up here; an invoice whose PO "
+        "disagrees with its shipment's is RI-006. Decimal in Python. HIGH."
     ),
 )
 def se_004(session: Session) -> RuleCheck:

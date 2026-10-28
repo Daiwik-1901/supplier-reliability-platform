@@ -14,7 +14,7 @@ capacity rate unit (they are different dimensions by design).
 
 from collections import defaultdict
 from datetime import date
-from decimal import Decimal
+from decimal import ROUND_HALF_UP, Decimal
 from typing import Any
 
 import sqlalchemy as sa
@@ -389,9 +389,12 @@ def dc_008(session: Session) -> RuleCheck:
     category="domain",
     severity=Severity.LOW,
     description=(
-        "Informational (D12): a contract-month whose demand (sum of ordered quantity of "
-        "non-cancelled POs ordered that month) exceeds the contract's contracted_capacity. The "
-        "capacity score uses verified capacity instead, so this is LOW."
+        "Informational (D12, Ruling R32): ONE finding per contract whose monthly demand (sum "
+        "of ordered quantity of non-cancelled POs ordered that month) exceeded its "
+        "contracted_capacity in any month; observed = '{months exceeded}/{months with demand} "
+        "months, max ratio {worst demand / capacity, 2 dp}'. checked = contracts evaluated "
+        "(non-null capacity, at least one month with demand). The capacity score uses verified "
+        "capacity instead, so this is LOW."
     ),
 )
 def dc_009(session: Session) -> RuleCheck:
@@ -414,20 +417,32 @@ def dc_009(session: Session) -> RuleCheck:
     for r in session.execute(stmt):
         demand[(r.contract_id, r.order_date.replace(day=1))] += r.ordered_quantity
         capacity[r.contract_id] = r.contracted_capacity
-    violations = [
-        Violation(
-            "contracts",
-            contract_id,
-            "contracted_capacity",
-            f"{month:%Y-%m}: demand {total} > {capacity[contract_id]}",
-            "monthly demand <= contracted_capacity",
-            f"contract {contract_id} demand in {month:%Y-%m} ({total}) exceeds its contracted "
-            f"capacity {capacity[contract_id]}",
+    months: dict[str, list[Decimal]] = defaultdict(list)  # contract -> monthly demand totals
+    for (contract_id, _), total in sorted(demand.items()):
+        months[contract_id].append(total)
+    violations = []
+    for contract_id, totals in sorted(months.items()):
+        ceiling = capacity[contract_id]
+        over = [t for t in totals if t > ceiling]
+        if not over:
+            continue
+        worst = (
+            "inf"
+            if ceiling == 0
+            else str((max(over) / ceiling).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP))
         )
-        for (contract_id, month), total in sorted(demand.items())
-        if total > capacity[contract_id]
-    ]
-    return RuleCheck(len(demand), violations)
+        violations.append(
+            Violation(
+                "contracts",
+                contract_id,
+                "contracted_capacity",
+                f"{len(over)}/{len(totals)} months, max ratio {worst}",
+                "monthly demand <= contracted_capacity",
+                f"contract {contract_id} demand exceeded its contracted capacity {ceiling} in "
+                f"{len(over)} of {len(totals)} months with demand (worst x{worst})",
+            )
+        )
+    return RuleCheck(len(months), violations)
 
 
 @rule(

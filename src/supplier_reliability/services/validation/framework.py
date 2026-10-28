@@ -20,7 +20,11 @@ Conventions:
 `run_validation` runs the selected rules (all by default) and, with `persist=True`, stores one
 ValidationRun plus its ValidationFindings in ONE transaction that it commits itself (the
 ScoringService pattern): it refuses to start while the session holds pending ORM changes, and
-rolls back on error. With `persist=False` it neither writes nor commits (run_id is None).
+rolls back on error. That guard sees ORM state only (session.new/dirty/deleted): Core writes
+(session.execute(insert/update/delete)) leave no trace there. Callers must not hold uncommitted
+Core writes when calling run_validation with persist=True, because its commit would commit them
+too (and its rollback on error would discard them). With `persist=False` it neither writes nor
+commits (run_id is None).
 `is_expected_anomaly` is True iff the finding's entity id equals the source_record_id of a
 data_exceptions row, i.e. a record the anomaly detectors already quarantined; it never comes
 from ground truth.

@@ -26,6 +26,7 @@ from supplier_reliability.domain.enums import (
 )
 from supplier_reliability.models import (
     CapacityDeclaration,
+    ComplianceRequirement,
     Contract,
     DataException,
     DeliveryEvent,
@@ -39,6 +40,7 @@ from supplier_reliability.models import (
     Shipment,
     ShipmentLineAllocation,
     Site,
+    SupplierCertification,
     SupplierScore,
     ValidationFinding,
     ValidationRun,
@@ -138,6 +140,10 @@ def check(session: Session, rule_id: str) -> list[Finding]:
     return run_validation(session, [rule_id], persist=False, clock=lambda: NOW).findings
 
 
+def vp(entity_type: str, payload) -> list[Finding]:
+    return validate_payload(entity_type, payload, detected_at=NOW)
+
+
 def fired_on(session: Session, rule_id: str) -> set[str | None]:
     found = check(session, rule_id)
     assert all(f.rule_id == rule_id for f in found)
@@ -182,10 +188,27 @@ def test_clean_scored_graph_has_no_findings(db_session, graph, app_config):
 
 
 def test_ri001_reports_checked_keys_and_no_duplicates(db_session, graph):
-    # every key RI-001 checks is also a PK/unique constraint, so it cannot be corrupted here:
-    # the rule is defence in depth (exports, other backends); it must still examine rows
     result = run_validation(db_session, ["RI-001"], persist=False, clock=lambda: NOW)
     assert result.findings == [] and result.checked_counts_by_rule["RI-001"] > 0
+
+
+def test_ri001_unenforced_natural_keys(db_session, graph):
+    """Capacity (supplier, site, month) and one invoice per shipment are NOT schema-enforced."""
+    a, g = graph.a, graph.g
+    # graph.capacity is a supplier-wide (site NULL) January declaration: NULL-safe key match
+    null_site_dup = g.capacity(supplier_id=a.supplier_id, month=date(2025, 1, 1), available="5")
+    g.capacity(supplier_id=a.supplier_id, site_id=a.site_id, month=date(2025, 2, 1), available="9")
+    site_dup = g.capacity(
+        supplier_id=a.supplier_id, site_id=a.site_id, month=date(2025, 2, 1), available="7"
+    )
+    second_invoice = g.invoice(shipment_id=graph.shipment, invoice_date=date(2025, 2, 4))
+    found = check(db_session, "RI-001")
+    assert {(f.entity_type, f.entity_id) for f in found} == {
+        ("capacity_declarations", null_site_dup),
+        ("capacity_declarations", site_dup),
+        ("invoices", second_invoice),
+    }
+    assert len(found) == 3
 
 
 def test_ri002_orphan_foreign_key(db_session, graph):
@@ -277,7 +300,7 @@ def test_dc001_blank_required_field(db_session, graph):
 
 
 def test_dc002_enum_value_via_payload():
-    found = validate_payload("SHIPMENT", {**_shipment_payload(), "shipment_status": "BOGUS"})
+    found = vp("SHIPMENT", {**_shipment_payload(), "shipment_status": "BOGUS"})
     assert [(f.rule_id, f.field) for f in found] == [("DC-002", "shipment_status")]
     assert found[0].entity_id == "SHP-RAW-1" and found[0].severity == Severity.HIGH
 
@@ -321,15 +344,23 @@ def test_dc008_unit_of_measure_mismatches(db_session, graph):
     assert fired_on(db_session, "DC-008") == {graph.allocation, graph.capacity}
 
 
-def test_dc009_monthly_demand_above_contracted_capacity_is_low(db_session, graph):
-    a = graph.a
-    po = graph.g.purchase_order(
-        supplier_id=a.supplier_id, contract_id=a.contract_id, order_date=date(2025, 1, 20)
-    )
-    graph.g.po_line(po_id=po, ordered_quantity="20000")
-    found = check(db_session, "DC-009")
-    assert [(f.entity_id, f.severity) for f in found] == [(a.contract_id, Severity.LOW)]
-    assert "2025-01" in (f := found[0]).observed_value and f.field == "contracted_capacity"
+def test_dc009_one_low_finding_per_contract_over_capacity(db_session, graph):
+    """Ruling R32: one finding per contract, summarising the months that exceeded."""
+    a, g = graph.a, graph.g
+    for day, qty in ((date(2025, 1, 20), "20000"), (date(2025, 2, 3), "100")):
+        po = g.purchase_order(supplier_id=a.supplier_id, contract_id=a.contract_id, order_date=day)
+        g.po_line(po_id=po, ordered_quantity=qty)
+    for day in (date(2025, 3, 3), date(2025, 3, 20)):  # March: 2 x 6000 = 12000 > 10000
+        po = g.purchase_order(supplier_id=a.supplier_id, contract_id=a.contract_id, order_date=day)
+        g.po_line(po_id=po, ordered_quantity="6000")
+    result = run_validation(db_session, ["DC-009"], persist=False, clock=lambda: NOW)
+    found = result.findings
+    assert [(f.entity_id, f.field, f.severity) for f in found] == [
+        (a.contract_id, "contracted_capacity", Severity.LOW)
+    ]
+    # January 20100 / 10000 = 2.01 is the worst month; February (100) is within capacity
+    assert found[0].observed_value == "2/3 months, max ratio 2.01"
+    assert result.checked_counts_by_rule["DC-009"] == 1  # contracts evaluated
 
 
 def test_dc010_verified_capacity_committed_above_available(db_session, graph):
@@ -355,6 +386,16 @@ def test_ch003_arrived_before_dispatched(db_session, graph):
     assert fired_on(db_session, "CH-003") == {graph.events[E.ARRIVED]}
 
 
+def test_ch003_one_finding_with_two_dispatched_events(db_session, graph):
+    graph.g.event(
+        shipment_id=graph.shipment, event_type=E.DISPATCHED, event_timestamp=utc(2025, 1, 28)
+    )
+    corrupt(db_session, DeliveryEvent, graph.events[E.ARRIVED], event_timestamp=utc(2025, 1, 26))
+    found = check(db_session, "CH-003")
+    assert [f.entity_id for f in found] == [graph.events[E.ARRIVED]]
+    assert "2025-01-27" in found[0].expected_condition  # compared with the earliest DISPATCHED
+
+
 def test_ch004_inspection_before_arrival(db_session, graph):
     corrupt(db_session, Inspection, graph.inspection, inspection_timestamp=utc(2025, 1, 31))
     assert fired_on(db_session, "CH-004") == {graph.inspection}
@@ -367,6 +408,89 @@ def test_ch005_score_evidence_recorded_after_cutoff(db_session, graph, app_confi
     assert [(f.entity_type, f.entity_id) for f in found] == [("supplier_scores", score_id)]
     assert graph.inspection in found[0].observed_value
     assert found[0].severity == Severity.CRITICAL
+
+
+@dataclass(frozen=True)
+class Ch005:
+    score_id: str
+    requirement: str
+    certification: str
+
+
+@pytest.fixture
+def ch005(db_session, graph, app_config) -> Ch005:
+    """graph plus a satisfied ISO9001 requirement, scored for Q1 (cutoff 2025-03-31 23:59:59)."""
+    a = graph.a
+    req = graph.g.requirement(contract_id=a.contract_id)
+    cert = graph.g.certification(supplier_id=a.supplier_id)
+    return Ch005(_score(db_session, app_config, a.supplier_id), req, cert)
+
+
+def _evidence_where(session, score_id, record_id, **values) -> None:
+    session.execute(
+        sa.update(ScoreEvidence)
+        .where(ScoreEvidence.score_id == score_id, ScoreEvidence.source_record_id == record_id)
+        .values(**values)
+    )
+
+
+CH005_CASES = {
+    # case -> (corruption(session, graph, ch005), expected finding fields)
+    "delivery_event_recorded_late": (
+        lambda s, g, c: corrupt(
+            s, DeliveryEvent, g.events[E.ARRIVED], recorded_timestamp=utc(2025, 4, 2)
+        ),
+        ["delivery_event.recorded_timestamp"],
+    ),
+    "invoice_dated_on_cutoff_day_is_valid": (
+        lambda s, g, c: corrupt(s, Invoice, g.invoice, invoice_date=date(2025, 3, 31)),
+        [],
+    ),
+    "invoice_dated_after_cutoff_day": (
+        lambda s, g, c: corrupt(s, Invoice, g.invoice, invoice_date=date(2025, 4, 1)),
+        ["invoice.invoice_date"],
+    ),
+    "po_line_via_po_order_date": (
+        lambda s, g, c: corrupt(s, PurchaseOrder, g.po, order_date=date(2025, 4, 1)),
+        ["po_line.purchase_order.order_date"],
+    ),
+    "certification_from_contribution": (
+        lambda s, g, c: corrupt(
+            s, SupplierCertification, c.certification, recorded_at=utc(2025, 5, 1)
+        ),
+        ["supplier_certification.recorded_at"],
+    ),
+    "requirement_effective_after_cutoff": (
+        lambda s, g, c: corrupt(
+            s, ComplianceRequirement, c.requirement, effective_from=date(2025, 4, 1)
+        ),
+        ["compliance_requirement.effective_from"],
+    ),
+    "requirement_effective_on_cutoff_day_is_valid": (
+        lambda s, g, c: corrupt(
+            s, ComplianceRequirement, c.requirement, effective_from=date(2025, 3, 31)
+        ),
+        [],
+    ),
+    "missing_source_record": (
+        lambda s, g, c: s.execute(
+            sa.delete(Inspection).where(Inspection.inspection_id == g.inspection)
+        ),
+        ["inspection.source_record"],
+    ),
+    "unknown_entity_type": (
+        lambda s, g, c: _evidence_where(s, c.score_id, g.inspection, source_entity_type="mystery"),
+        ["score_evidence.source_entity_type"],
+    ),
+}
+
+
+@pytest.mark.parametrize("case", sorted(CH005_CASES))
+def test_ch005_cutoff_compliance_per_entity_type(db_session, graph, ch005, case):
+    corruption, fields = CH005_CASES[case]
+    corruption(db_session, graph, ch005)
+    found = check(db_session, "CH-005")
+    assert [(f.entity_id, f.field) for f in found] == [(ch005.score_id, x) for x in fields]
 
 
 def test_ch006_risk_signal_recorded_before_observed(db_session, graph):
@@ -426,7 +550,7 @@ def test_ar004_inspected_more_than_received(db_session, graph):
 
 def test_ar004_reconciliation_via_payload():
     payload = {**_inspection_payload(), "accepted_quantity": "8", "rejected_quantity": "1"}
-    found = validate_payload("INSPECTION", payload)
+    found = vp("INSPECTION", payload)
     assert [(f.rule_id, f.entity_id) for f in found] == [("AR-004", "INS-RAW-1")]
 
 
@@ -456,6 +580,33 @@ def test_ar007_lineage_count_differs_from_explanation(db_session, graph, app_con
     )
     found = check(db_session, "AR-007")
     assert [(f.entity_id, f.field) for f in found] == [(score_id, "quality")]
+
+
+def _drop_lineage(session, score_id: str, record_id: str) -> None:
+    session.execute(
+        sa.delete(ScoreEvidence).where(
+            ScoreEvidence.score_id == score_id, ScoreEvidence.source_record_id == record_id
+        )
+    )
+
+
+def test_ar007_delivery_counts_shipment_rows_only(db_session, graph, app_config):
+    score_id = _score(db_session, app_config, graph.a.supplier_id)
+    _drop_lineage(db_session, score_id, graph.events[E.ARRIVED])  # event lineage: not counted
+    assert check(db_session, "AR-007") == []
+    _drop_lineage(db_session, score_id, graph.shipment)
+    found = check(db_session, "AR-007")
+    assert [(f.entity_id, f.field) for f in found] == [(score_id, "delivery")]
+
+
+def test_ar007_capacity_compares_listed_source_ids(db_session, graph, app_config):
+    score_id = _score(db_session, app_config, graph.a.supplier_id)
+    listed = db_session.get(SupplierScore, score_id).explanation["components"]["capacity"]
+    assert graph.capacity in listed["source_record_ids"] and listed["observations"] == 1
+    _drop_lineage(db_session, score_id, graph.capacity)
+    found = check(db_session, "AR-007")
+    assert [(f.entity_id, f.field) for f in found] == [(score_id, "capacity")]
+    assert found[0].expected_condition == "= explanation listed source records 2"
 
 
 # --- semantic ------------------------------------------------------------------------------------
@@ -697,7 +848,7 @@ PAYLOADS = {
 
 @pytest.mark.parametrize("entity_type", sorted(PAYLOADS))
 def test_valid_payloads_have_no_findings(entity_type):
-    assert validate_payload(entity_type, PAYLOADS[entity_type]()) == []
+    assert vp(entity_type, PAYLOADS[entity_type]()) == []
 
 
 @pytest.mark.parametrize(
@@ -712,7 +863,7 @@ def test_valid_payloads_have_no_findings(entity_type):
     ],
 )
 def test_risk_payload_findings(change, rule_id, field):
-    found = validate_payload("RISK_SIGNAL", {**_risk_payload(), **change})
+    found = vp("RISK_SIGNAL", {**_risk_payload(), **change})
     assert [(f.rule_id, f.field, f.entity_id) for f in found] == [(rule_id, field, "RSK-RAW-1")]
 
 
@@ -721,7 +872,7 @@ def test_payload_missing_field_and_negative_quantity():
     del payload["po_id"]
     payload["shipped_quantity"] = "-1"
     payload["received_quantity"] = "0"
-    found = validate_payload("SHIPMENT", payload)
+    found = vp("SHIPMENT", payload)
     assert sorted((f.rule_id, f.field) for f in found) == [
         ("DC-001", "po_id"),
         ("DC-003", "shipped_quantity"),
@@ -730,37 +881,49 @@ def test_payload_missing_field_and_negative_quantity():
 
 def test_payload_arithmetic_and_chronology_checks():
     shp = {**_shipment_payload(), "received_quantity": "120"}
-    assert [(f.rule_id, f.field) for f in validate_payload("SHIPMENT", shp)] == [
-        ("AR-003", "received_quantity")
-    ]
+    assert [(f.rule_id, f.field) for f in vp("SHIPMENT", shp)] == [("AR-003", "received_quantity")]
     early = {**_shipment_payload(), "actual_delivery_timestamp": "2025-01-26T00:00:00Z"}
-    assert [(f.rule_id, f.field) for f in validate_payload("SHIPMENT", early)] == [
+    assert [(f.rule_id, f.field) for f in vp("SHIPMENT", early)] == [
         ("CH-003", "actual_delivery_timestamp")
     ]
     score = {**_score_payload(), "overall_score": "70.00"}
-    assert [(f.rule_id, f.field) for f in validate_payload("SUPPLIER_SCORE", score)] == [
+    assert [(f.rule_id, f.field) for f in vp("SUPPLIER_SCORE", score)] == [
         ("AR-006", "overall_score")
     ]
     event = {**_event_payload(), "event_type": "TELEPORTED"}
-    assert [(f.rule_id, f.field) for f in validate_payload("DELIVERY_EVENT", event)] == [
-        ("DC-002", "event_type")
+    assert [(f.rule_id, f.field) for f in vp("DELIVERY_EVENT", event)] == [("DC-002", "event_type")]
+
+
+def test_event_payload_recorded_before_it_happened():
+    """D4: recorded_timestamp >= event_timestamp (reported under CH-007, event chronology)."""
+    event = {**_event_payload(), "recorded_timestamp": "2025-02-01T05:00:00Z"}
+    found = vp("DELIVERY_EVENT", event)
+    assert [(f.rule_id, f.field, f.entity_id) for f in found] == [
+        ("CH-007", "recorded_timestamp", "EVT-RAW-1")
     ]
 
 
 def test_payload_findings_use_the_given_detection_time():
-    found = validate_payload(
-        "SHIPMENT", {**_shipment_payload(), "shipment_status": "BOGUS"}, detected_at=NOW
-    )
-    assert found[0].detection_timestamp == NOW
+    later = datetime(2027, 1, 2, 3, 4, tzinfo=UTC)
+    payload = {**_shipment_payload(), "shipment_status": "BOGUS"}
+    found = validate_payload("SHIPMENT", payload, detected_at=later)
+    assert found[0].detection_timestamp == later
     assert found[0].entity_type == "shipments"
+
+
+def test_payload_detection_time_is_required():
+    with pytest.raises(TypeError):
+        validate_payload("SHIPMENT", _shipment_payload())  # no wall-clock fallback
+    with pytest.raises(TypeError):
+        validate_payload("SHIPMENT", _shipment_payload(), NOW)  # keyword-only
 
 
 def test_payload_validator_rejects_unknown_entity_type():
     with pytest.raises(ValueError, match="UNKNOWN"):
-        validate_payload("UNKNOWN", {})
+        vp("UNKNOWN", {})
 
 
 def test_dc004_payload_money_precision_is_checked_too():
     # score payloads carry 2-dp scores; more decimals are a precision finding
-    found = validate_payload("SUPPLIER_SCORE", {**_score_payload(), "delivery_score": "80.001"})
+    found = vp("SUPPLIER_SCORE", {**_score_payload(), "delivery_score": "80.001"})
     assert ("DC-004", "delivery_score") in {(f.rule_id, f.field) for f in found}

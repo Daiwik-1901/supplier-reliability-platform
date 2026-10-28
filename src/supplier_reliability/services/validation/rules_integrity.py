@@ -70,8 +70,15 @@ def entity_key(row: Any, names: list[str]) -> str:
 
 # --- RI-001 -------------------------------------------------------------------------------------
 
-# Export-level natural keys (D3, D11, PO line numbering); each must identify one row.
+# Natural keys; each must identify one row. The first two are NOT enforced by the schema and
+# are the reason RI-001 exists: a second capacity declaration for the same supplier, site
+# (NULL = supplier-wide) and month silently doubles D12 verified free capacity, and a second
+# invoice for one shipment breaks D3 (one invoice per delivered shipment). The remaining keys,
+# and the primary keys below, are also schema constraints: checking them is defence in depth
+# (exports, other backends, schema drift) and costs ~0.1 s at full scale.
 _NATURAL_KEYS: tuple[tuple[Any, tuple[str, ...]], ...] = (
+    (CapacityDeclaration, ("supplier_id", "site_id", "period_start")),
+    (Invoice, ("shipment_id",)),
     (Invoice, ("supplier_id", "supplier_invoice_number")),
     (POLine, ("po_id", "line_number")),
     (SupplierCertification, ("supplier_id", "certificate_number", "recorded_at")),
@@ -85,7 +92,8 @@ def _duplicates(session: Session, model: Any, key: tuple[str, ...]) -> list[Viol
     groups = sa.select(*cols).group_by(*cols).having(sa.func.count() > 1).subquery("duplicate_keys")
     stmt = (
         sa.select(*[table.c[n] for n in pk], *cols)
-        .join(groups, sa.and_(*[table.c[k] == groups.c[k] for k in key]))
+        # NULL-safe: a NULL site_id (supplier-wide declaration) is a key value like any other
+        .join(groups, sa.and_(*[table.c[k].is_not_distinct_from(groups.c[k]) for k in key]))
         .order_by(*cols, *[table.c[n] for n in pk])
     )
     out, seen = [], set()
@@ -110,10 +118,12 @@ def _duplicates(session: Session, model: Any, key: tuple[str, ...]) -> list[Viol
     "RI-001",
     **INTEGRITY,
     description=(
-        "Unique keys: export-level natural keys (supplier_invoice_number per supplier, "
-        "(po_id, line_number), certificate (supplier, number, recorded_at)) occur once, and "
-        "every canonical table's primary key is unique (COUNT vs COUNT DISTINCT). HIGH: a "
-        "duplicate key multiplies joins and exports."
+        "Unique keys. Not schema-enforced: one capacity declaration per (supplier, site or "
+        "supplier-wide, period_start) (a duplicate doubles D12 free capacity) and one invoice "
+        "per shipment (D3). Defence in depth (also schema constraints): supplier_invoice_number "
+        "per supplier, (po_id, line_number), certificate (supplier, number, recorded_at), and "
+        "every canonical table's primary key (COUNT vs COUNT DISTINCT). HIGH: a duplicate key "
+        "multiplies joins and aggregates."
     ),
 )
 def ri_001(session: Session) -> RuleCheck:

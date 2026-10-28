@@ -104,24 +104,33 @@ def ch_002(session: Session) -> RuleCheck:
     "CH-003",
     **_HIGH,
     description=(
-        "Every ARRIVED event of a shipment is at or after its DISPATCHED event (D4; anomaly B "
-        "in canonical form). The finding names the ARRIVED event. HIGH."
+        "Every ARRIVED event of a shipment is at or after its earliest DISPATCHED event (D4; "
+        "anomaly B in canonical form). Compared with min(DISPATCHED) per shipment, so one "
+        "ARRIVED event yields at most one finding; the finding names the ARRIVED event. HIGH."
     ),
 )
 def ch_003(session: Session) -> RuleCheck:
-    arrived, dispatched = aliased(DeliveryEvent), aliased(DeliveryEvent)
+    arrived = aliased(DeliveryEvent)
+    dispatched = (
+        sa.select(
+            DeliveryEvent.shipment_id,
+            sa.func.min(DeliveryEvent.event_timestamp).label("dispatched_at"),
+        )
+        .where(DeliveryEvent.event_type == E.DISPATCHED)
+        .group_by(DeliveryEvent.shipment_id)
+        .subquery()
+    )
     stmt = (
         sa.select(
             arrived.delivery_event_id,
             arrived.shipment_id,
             arrived.event_timestamp,
-            dispatched.event_timestamp.label("dispatched_at"),
+            dispatched.c.dispatched_at,
         )
-        .join(dispatched, dispatched.shipment_id == arrived.shipment_id)
+        .join(dispatched, dispatched.c.shipment_id == arrived.shipment_id)
         .where(
             arrived.event_type == E.ARRIVED,
-            dispatched.event_type == E.DISPATCHED,
-            arrived.event_timestamp < dispatched.event_timestamp,
+            arrived.event_timestamp < dispatched.c.dispatched_at,
         )
         .order_by(arrived.delivery_event_id)
     )
@@ -252,7 +261,10 @@ _SOURCES: dict[str, tuple[Any, Any, list[tuple[str, Any]], list[tuple[Any, Any]]
     "compliance_requirement": (
         ComplianceRequirement,
         ComplianceRequirement.requirement_id,
-        [("created_at", ComplianceRequirement.created_at)],
+        [
+            ("created_at", ComplianceRequirement.created_at),
+            ("effective_from", ComplianceRequirement.effective_from),  # DATE: day granularity
+        ],
         [],
     ),
     "supplier_certification": (
@@ -294,8 +306,9 @@ def _leak(score_id: str, entity: str, record_id: str, what: str, value: Any, cut
         "source record whose occurrence or recording time is after the score's "
         "data_cutoff_timestamp (shipment expected/created, event time/recorded, inspection "
         "time/recorded, invoice date/recorded, PO line created and its PO's order date/created, "
-        "capacity/certification recorded, requirement created, risk signal observed/recorded; "
-        "a compliance row's certification from its contribution). An included row whose source "
+        "capacity/certification recorded, requirement created and effective_from (date), risk "
+        "signal observed/recorded; a compliance row's certification from its contribution). "
+        "An included row whose source "
         "record is missing, or of an unknown entity type, cannot be proven compliant and is "
         "reported too. One set-based join per entity type. CRITICAL: future leakage."
     ),

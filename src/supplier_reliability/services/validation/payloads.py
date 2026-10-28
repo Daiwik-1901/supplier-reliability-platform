@@ -1,8 +1,8 @@
 """Pydantic validation of raw payloads that cannot (yet) reach canonical tables (Task 13; reused
 by the Task 15 detectors).
 
-`validate_payload(entity_type, payload)` returns Findings under the canonical rule ids, so a raw
-record and a canonical row with the same defect are reported alike:
+`validate_payload(entity_type, payload, *, detected_at)` returns Findings under the canonical
+rule ids, so a raw record and a canonical row with the same defect are reported alike:
 
 - DC-001: a required field is missing, null, blank, unparseable or a naive timestamp (it is
   unusable either way).
@@ -10,7 +10,8 @@ record and a canonical row with the same defect are reported alike:
 - DC-003: a negative quantity, or a score/coverage outside its range.
 - DC-004: more than 2 decimal places on a money/quantity/score value.
 - Cross-field checks, run only when every field parsed: AR-003 (shipment received <= shipped),
-  CH-003 (shipment arrival >= dispatch), AR-004 (inspection: accepted + rejected = inspected,
+  CH-003 (shipment arrival >= dispatch), CH-007 (delivery event recorded >= event time, D4;
+  the event-chronology rule), AR-004 (inspection: accepted + rejected = inspected,
   rejected <= defect <= inspected), CH-006 (risk signal observed <= recorded), AR-006 (score:
   overall = sum ew_k c_k / sum ew_k over the non-null components, +/- 0.01, effective_weights
   keys = those components).
@@ -21,7 +22,7 @@ Database-dependent checks (does the PO exist, did the shipment dispatch earlier,
 detectors' job. Findings use the table name as entity_type and the payload's id as entity_id.
 """
 
-from datetime import UTC, datetime
+from datetime import datetime
 from decimal import Decimal
 from typing import Annotated, Any
 
@@ -40,6 +41,7 @@ from supplier_reliability.domain.enums import (
     Severity,
     ShipmentStatus,
 )
+from supplier_reliability.domain.numeric import ensure_utc
 from supplier_reliability.services.validation.framework import Finding, Violation, to_finding
 from supplier_reliability.services.validation.rules_arithmetic import (
     SCORE_TOLERANCE,
@@ -208,6 +210,15 @@ def _cross_field(table: str, entity_id: str | None, p: _Payload) -> list[tuple]:
                 f">= dispatch {p.dispatch_timestamp.isoformat()}",
                 "shipment arrived before it was dispatched",
             )
+    elif isinstance(p, DeliveryEventPayload):
+        if p.recorded_timestamp < p.event_timestamp:
+            add(
+                "CH-007",
+                "recorded_timestamp",
+                p.recorded_timestamp.isoformat(),
+                f">= event_timestamp {p.event_timestamp.isoformat()}",
+                "delivery event recorded before it happened (D4)",
+            )
     elif isinstance(p, InspectionPayload):
         if p.accepted_quantity + p.rejected_quantity != p.inspected_quantity:
             add(
@@ -263,16 +274,17 @@ def _cross_field(table: str, entity_id: str | None, p: _Payload) -> list[tuple]:
     return out
 
 
-def validate_payload(
-    entity_type: str, payload: Any, *, detected_at: datetime | None = None
-) -> list[Finding]:
-    """Findings for one raw payload of `entity_type` (one of PAYLOAD_ENTITY_TYPES)."""
+def validate_payload(entity_type: str, payload: Any, *, detected_at: datetime) -> list[Finding]:
+    """Findings for one raw payload of `entity_type` (one of PAYLOAD_ENTITY_TYPES).
+
+    `detected_at` is required (keyword-only) and stamped on every finding: there is no
+    wall-clock fallback, so a pipeline run with an injected clock stays deterministic."""
     if entity_type not in _MODELS:
         raise ValueError(
             f"unsupported payload entity type {entity_type!r}; known: {sorted(_MODELS)}"
         )
     model, table, id_field = _MODELS[entity_type]
-    when = detected_at or datetime.now(UTC)
+    when = ensure_utc(detected_at)
     if not isinstance(payload, dict):
         v = Violation(table, None, None, type(payload).__name__, "a JSON object", "not an object")
         return [to_finding("DC-001", v, when)]
