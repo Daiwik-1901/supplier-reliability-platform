@@ -17,7 +17,7 @@ import sqlalchemy as sa
 from sqlalchemy.orm import Session
 
 from supplier_reliability.database import make_engine, make_session_factory
-from supplier_reliability.domain.enums import ReliabilityCategory, Severity
+from supplier_reliability.domain.enums import ReliabilityCategory, Severity, ShipmentStatus
 from supplier_reliability.models import (
     Base,
     Inspection,
@@ -44,6 +44,7 @@ from supplier_reliability.services.reporting import (
     metric_problems,
     missing_data_rates,
     reconciliation_report,
+    render_markdown,
     score_distribution,
     summary,
     supplier_rankings,
@@ -89,13 +90,13 @@ def reports(session, run_id, detected_db, ground_truth_dir, windows, app_config,
         "entity_counts": entity_counts(session),
         "supplier_rankings": supplier_rankings(session, limit=10),
         "score_distribution": score_distribution(session),
-        "delivery_quality_trends": delivery_quality_trends(
-            session, grace_hours=app_config.scoring.grace_hours
-        ),
+        "delivery_quality_trends": delivery_quality_trends(session, app_config.scoring.grace_hours),
         "invoice_variance_distribution": invoice_variance_distribution(session),
         "capacity_risk": capacity_risk(session),
         "compliance_exceptions": compliance_exceptions(session),
-        "disruption_exposure": disruption_exposure(session),
+        "disruption_exposure": disruption_exposure(
+            session, lookback_days=app_config.scoring.lookback_days
+        ),
         "missing_data_rates": missing_data_rates(session),
         "deteriorating_suppliers": deteriorating_suppliers(session, threshold=threshold),
         "data_quality": data_quality(session, run_id),
@@ -180,6 +181,15 @@ def test_every_metric_has_numerator_and_denominator(reports):
             assert leaf["filters"] and leaf["window"] and leaf["missing_data_handling"]
             if leaf["numerator"] is None or leaf["denominator"] is None:
                 assert "no denominator" in leaf["missing_data_handling"]
+            elif "value is null when the denominator is 0" in leaf["missing_data_handling"]:
+                den = Decimal(str(leaf["denominator"]))
+                if den == 0:
+                    assert leaf["value"] is None
+                else:
+                    want = round(float(Decimal(str(leaf["numerator"])) / den), 6)
+                    assert leaf["value"] == want, leaf
+            elif isinstance(leaf["value"], int) and not isinstance(leaf["value"], bool):
+                assert leaf["value"] == leaf["numerator"], leaf  # counted(): value = numerator
 
 
 def _walk(node):
@@ -211,6 +221,7 @@ def test_variance_buckets_sum_to_invoice_count_minus_excluded(session, reports):
     assert sum(m["value"] for m in buckets.values()) == len(invoices) - len(excluded)
     assert rep["metrics"]["excluded_zero_expected"]["value"] == len(excluded)
     assert rep["metrics"]["invoices"]["value"] == len(invoices)
+    assert rep["metrics"]["invoices_outside_reference_period"]["value"] == 0
 
     def bucket(v: Decimal) -> str:
         if v < Decimal("-0.05"):
@@ -223,11 +234,10 @@ def test_variance_buckets_sum_to_invoice_count_minus_excluded(session, reports):
             return "1_to_5pct"
         return "gt_5pct"
 
-    expected = Counter(bucket(i.variance_amount / i.expected_amount) for i in invoices
-                       if i.expected_amount != 0)  # fmt: skip
-    got = {k: m["value"] for k, m in buckets.items() if m["value"]}
-    # buckets use the stored 6-dp variance_percentage; allow only boundary-rounding drift
-    assert sum(abs(got.get(k, 0) - expected.get(k, 0)) for k in set(got) | set(expected)) <= 2
+    expected = Counter(
+        bucket(i.variance_amount / i.expected_amount) for i in invoices if i.expected_amount != 0
+    )
+    assert {k: m["value"] for k, m in buckets.items()} == {k: expected.get(k, 0) for k in buckets}
     total_exp = sum((i.expected_amount for i in invoices), Decimal("0"))
     assert Decimal(str(rep["metrics"]["total_expected_amount"]["value"])) == total_exp
 
@@ -305,7 +315,7 @@ def test_deteriorating_matches_definition_d7(session, reports, app_config):
     assert rep["metrics"]["deteriorating"]["numerator"] == len(expected)
     assert rep["metrics"]["deteriorating"]["denominator"] == comparable
     assert {"delta_min", "delta_p5", "delta_median"} <= set(
-        rep["metrics"]["quarter_over_quarter_delta"]
+        rep["metrics"]["window_over_window_delta"]
     )
 
 
@@ -446,3 +456,176 @@ def test_every_report_renders_markdown(reports, tmp_path):
     for name, payload in reports.items():
         _, md = write_report(name, payload, tmp_path)
         assert md.read_text(encoding="utf-8").startswith("# ")
+
+
+# --- fix round 1 ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def scratch(detected_db, tmp_path) -> Iterator[Session]:
+    """A writable copy of the detected DB for tests that insert or alter rows."""
+    path = tmp_path / "scratch.db"
+    shutil.copyfile(detected_db.path, path)
+    engine = make_engine(f"sqlite:///{path}")
+    with make_session_factory(engine)() as s:
+        yield s
+    engine.dispose()
+
+
+def _clone(row, **changes):
+    mapper = sa.inspect(type(row)).mapper
+    values = {c.key: getattr(row, c.key) for c in mapper.column_attrs}
+    values.update(changes)
+    return type(row)(**values)
+
+
+def test_variance_includes_invoices_outside_period_and_uses_decimal_ratio(scratch):
+    base = invoice_variance_distribution(scratch)["metrics"]
+    template = scratch.scalars(sa.select(Invoice).where(Invoice.expected_amount != 0)).first()
+    far = _clone(
+        template,
+        invoice_id="INV-OUT-0001",
+        supplier_invoice_number="OUT-0001",
+        invoice_date=datetime(2027, 3, 1, tzinfo=UTC).date(),
+        expected_amount=Decimal("1000.00"),
+        invoiced_amount=Decimal("1051.00"),
+        variance_amount=Decimal("51.00"),
+        variance_percentage=Decimal("0.050000"),  # stored 6-dp value disagrees with the ratio
+    )
+    scratch.add(far)
+    scratch.commit()
+    got = invoice_variance_distribution(scratch)["metrics"]
+    assert got["invoices"]["value"] == base["invoices"]["value"] + 1
+    assert got["invoices_outside_reference_period"]["value"] == 1
+    # 51 / 1000 = 5.1% is above 5%: the Decimal ratio wins over the stored 0.050000
+    assert got["buckets"]["gt_5pct"]["value"] == base["buckets"]["gt_5pct"]["value"] + 1
+    assert got["buckets"]["1_to_5pct"]["value"] == base["buckets"]["1_to_5pct"]["value"]
+
+
+def test_superseded_score_never_feeds_reports(session, scratch, app_config):
+    _, latest = _latest(_current(scratch))
+    victim = next(
+        s for s in latest if s.reliability_category != ReliabilityCategory.INSUFFICIENT_EVIDENCE
+    )
+    ghost = _clone(
+        victim,
+        score_id="SCORE-GHOST-1",
+        is_current=False,
+        version_number=99,
+        overall_score=Decimal("1.00"),
+        delivery_score=None,
+        reliability_category=ReliabilityCategory.CRITICAL,
+    )
+    scratch.add(ghost)
+    scratch.commit()
+    threshold = app_config.scoring.deteriorating_threshold
+    builders = {
+        "rankings": supplier_rankings,
+        "distribution": score_distribution,
+        "missing": missing_data_rates,
+        "deteriorating": lambda s: deteriorating_suppliers(s, threshold=threshold),
+    }
+    for name, build in builders.items():
+        assert build(scratch) == build(session), name
+
+
+def test_non_insufficient_score_with_null_overall_is_listed_unranked(scratch):
+    _, latest = _latest(_current(scratch))
+    victim = next(
+        s for s in latest if s.reliability_category != ReliabilityCategory.INSUFFICIENT_EVIDENCE
+    )
+    scratch.execute(
+        sa.update(SupplierScore)
+        .where(SupplierScore.score_id == victim.score_id)
+        .values(overall_score=None)
+    )
+    scratch.commit()
+    rep = supplier_rankings(scratch)
+    m = rep["metrics"]
+    assert (
+        m["ranked_suppliers"]["value"] + m["unranked_suppliers"]["value"]
+        == m["window_suppliers"]["value"]
+    )
+    rows = rep["tables"]["insufficient_evidence"]
+    row = next(r for r in rows if r["supplier_id"] == victim.supplier_id)
+    assert row["missing_reasons"] == {"overall": "overall missing"}
+    assert victim.supplier_id not in {r["supplier_id"] for r in rep["tables"]["ranked"]}
+
+
+def test_trend_quarters_are_half_open_and_do_not_double_count(scratch, app_config):
+    grace = app_config.scoring.grace_hours
+
+    def due(rep):
+        return {
+            q: c["on_time_rate"]["denominator"] + c["arrival_unknown_shipments"]["value"]
+            for q, c in rep["metrics"]["by_quarter"].items()
+        }
+
+    base = due(delivery_quality_trends(scratch, grace))
+    template = scratch.scalars(sa.select(Shipment)).first()
+    edges = [
+        datetime(2025, 4, 1, tzinfo=UTC),
+        datetime(2025, 3, 31, 23, 59, 59, 500000, tzinfo=UTC),
+    ]
+    for n, ts in enumerate(edges):
+        scratch.add(
+            _clone(
+                template,
+                shipment_id=f"SHP-EDGE-{n}",
+                dispatch_timestamp=datetime(2025, 3, 1, tzinfo=UTC),
+                expected_delivery_timestamp=ts,
+                actual_delivery_timestamp=None,
+                shipment_status=ShipmentStatus.BOOKED,
+                shipped_quantity=Decimal("0"),
+                received_quantity=Decimal("0"),
+            )
+        )
+    scratch.commit()
+    after = due(delivery_quality_trends(scratch, grace))
+    assert after["2025Q1"] == base["2025Q1"] + 1  # the sub-second before midnight is in Q1
+    assert after["2025Q2"] == base["2025Q2"] + 1  # midnight exactly is in Q2 only
+    assert sum(after.values()) == sum(base.values()) + 2
+
+
+def _cells(line: str) -> int:
+    """Number of cells in a Markdown table row, honouring backslash escapes."""
+    count, escaped = 0, False
+    for ch in line:
+        if escaped:
+            escaped = False
+        elif ch == "\\":
+            escaped = True
+        elif ch == "|":
+            count += 1
+    return count - 1
+
+
+def test_markdown_escapes_backslash_pipe_and_newline_everywhere():
+    nasty = "a|b\\c\nd\\|e"
+    payload = {
+        "report": "x",
+        "title": "T",
+        "metrics": {nasty: metric(1, None, None, nasty, nasty, "count; no denominator " + nasty)},
+        "tables": {nasty: [{nasty: nasty, "plain": "v"}, {nasty: "\\", "plain": "|"}]},
+    }
+    md = render_markdown(payload)
+    table_lines = [ln for ln in md.splitlines() if ln.startswith("|")]
+    assert len(table_lines) == 3 + 4  # metrics: header, rule, row; table: header, rule, 2 rows
+    assert {_cells(ln) for ln in table_lines[:3]} == {7}
+    assert {_cells(ln) for ln in table_lines[3:]} == {2}
+    headings = [ln for ln in md.splitlines() if ln.startswith("## ")]
+    assert len(headings) == 2 and headings[1] == r"## a\|b\\c d\\\|e"
+
+
+def test_hard_coded_text_is_derived(reports, app_config):
+    window = reports["missing_data_rates"]["metrics"]["overall"]["delivery"]["window"]
+    assert window == "all 6 scorecard windows"
+    disr = reports["disruption_exposure"]["metrics"]["signals_by_severity"]["HIGH"]
+    assert f"{app_config.scoring.lookback_days}-day lookback" in disr["missing_data_handling"]
+
+
+def test_data_quality_labels_and_subset_wording(reports):
+    m = reports["data_quality"]["metrics"]
+    assert "LOW or NONE" in m["informational"]["total"]["filters"]
+    assert "of which expected anomalies" in m["expected_anomalies"]["filters"]
+    assert "subset" in m["expected_anomalies"]["filters"]

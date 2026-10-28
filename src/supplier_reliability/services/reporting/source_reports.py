@@ -52,7 +52,7 @@ def _quarter_label(start) -> str:
     return f"{start.year}Q{(start.month - 1) // 3 + 1}"
 
 
-def delivery_quality_trends(session: Session, grace_hours: int = 24) -> dict[str, Any]:
+def delivery_quality_trends(session: Session, grace_hours: int) -> dict[str, Any]:
     """Per calendar quarter of the reference period, from canonical source records.
 
     On-time rate = shipments whose arrival is on or before expected_delivery + grace, over
@@ -63,7 +63,9 @@ def delivery_quality_trends(session: Session, grace_hours: int = 24) -> dict[str
     excluded from the denominator.
     Defect rate = sum(defect_quantity) / sum(inspected_quantity) of the latest inspection (by
     inspection_timestamp, then inspection_id) per shipment allocation among inspections whose
-    timestamp is in the quarter; zero inspected units gives a null value."""
+    timestamp is in the quarter; zero inspected units gives a null value.
+    Quarter bounds are half-open: start <= timestamp < end + 1 second (end is the quarter's
+    last second), so a boundary timestamp belongs to exactly one quarter."""
     start, end = _reference_period(session)
     grace = timedelta(hours=grace_hours)
     shipments = session.execute(
@@ -86,14 +88,13 @@ def delivery_quality_trends(session: Session, grace_hours: int = 24) -> dict[str
     for q in quarter_windows(start, end):
         label = _quarter_label(q.start)
         window = f"{label}: {q.start:%Y-%m-%d} to {q.end:%Y-%m-%d}"
-        due = [
-            s for s in shipments if q.start <= s[0] <= q.end and s[2] != ShipmentStatus.CANCELLED
-        ]
+        upper = q.end + timedelta(seconds=1)
+        due = [s for s in shipments if q.start <= s[0] < upper and s[2] != ShipmentStatus.CANCELLED]
         known = [s for s in due if s[1] is not None]
         on_time = sum(s[1] <= s[0] + grace for s in known)
         latest: dict[str, Any] = {}
         for row in inspections:  # ordered, so the last write per allocation is the latest
-            if q.start <= row[1] <= q.end:
+            if q.start <= row[1] < upper:
                 latest[row[0]] = row
         defects = sum((r[4] for r in latest.values()), ZERO)
         inspected = sum((r[3] for r in latest.values()), ZERO)
@@ -155,29 +156,31 @@ def _bucket(pct: Decimal) -> str:
 
 
 def invoice_variance_distribution(session: Session) -> dict[str, Any]:
-    """Invoice variance_percentage (fraction of expected) buckets over every invoice dated in
-    the reference period. Invoices with zero expected amount (null percentage) are excluded and
-    counted."""
+    """Buckets of variance_amount / expected_amount (Decimal, not the stored 6-dp percentage)
+    over ALL invoices with a nonzero expected amount (R43: no invoice-date filter). Zero-expected
+    invoices are excluded and counted; invoices dated outside the reference period are counted
+    separately for context but stay in the buckets."""
     start, end = _reference_period(session)
-    window = f"invoice_date {start:%Y-%m-%d} to {end:%Y-%m-%d} (reference period)"
+    window = "all invoices (no invoice-date filter)"
     rows = session.execute(
         sa.select(
             Invoice.expected_amount,
             Invoice.invoiced_amount,
             Invoice.variance_amount,
-            Invoice.variance_percentage,
-        ).where(Invoice.invoice_date >= start.date(), Invoice.invoice_date <= end.date())
+            Invoice.invoice_date,
+        )
     ).all()
-    eligible = [r for r in rows if r[0] != 0 and r[3] is not None]
+    eligible = [r for r in rows if r[0] != 0]
     counts: dict[str, int] = defaultdict(int)
     for r in eligible:
-        counts[_bucket(r[3])] += 1
-    filters = "invoices in the period with expected_amount != 0"
+        counts[_bucket(r[2] / r[0])] += 1
+    outside = sum(not (start.date() <= r[3] <= end.date()) for r in rows)
+    filters = "invoices with expected_amount != 0"
     buckets = {
         key: counted(
             counts[key],
             len(eligible),
-            f"{filters}; bucket {desc} (stored variance_percentage)",
+            f"{filters}; bucket {desc} (variance_amount / expected_amount)",
             window,
             "zero-expected invoices are excluded from numerator and denominator",
         )
@@ -188,7 +191,13 @@ def invoice_variance_distribution(session: Session) -> dict[str, Any]:
     variance = sum((r[2] for r in eligible), ZERO)
     money = "sum over eligible invoices (Decimal); no denominator"
     metrics = {
-        "invoices": count_metric(len(rows), "all invoices dated in the period", window),
+        "invoices": count_metric(len(rows), "all invoices", window),
+        "invoices_outside_reference_period": count_metric(
+            outside,
+            f"invoices dated outside {start:%Y-%m-%d} to {end:%Y-%m-%d} (the scored windows)",
+            window,
+            "context only; they remain in the buckets",
+        ),
         "excluded_zero_expected": count_metric(
             len(rows) - len(eligible),
             "invoices with expected_amount = 0 (variance undefined)",

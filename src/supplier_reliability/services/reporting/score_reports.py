@@ -87,6 +87,8 @@ def supplier_rankings(
         key=lambda r: (-r[3], r[0]),
     )
     insufficient = [r for r in rows if r[4] == INSUFFICIENT]
+    no_overall = [r for r in rows if r[4] != INSUFFICIENT and r[3] is None]
+    unranked = sorted(insufficient + no_overall, key=lambda r: r[0])
     shown = ranked if limit is None else ranked[:limit]
 
     def base(r: Any) -> dict[str, Any]:
@@ -105,8 +107,13 @@ def supplier_rankings(
     tables = {
         "ranked": [{"rank": i, **base(r)} for i, r in enumerate(shown, 1)],
         "insufficient_evidence": [
-            {**base(r), "missing_reasons": r[9] or {}}
-            for r in sorted(insufficient, key=lambda r: r[0])
+            {
+                **base(r),
+                "missing_reasons": (r[9] or {})
+                if r[4] == INSUFFICIENT
+                else {"overall": "overall missing"},
+            }
+            for r in unranked
         ],
     }
     filters = f"{_SCOPE} in this window"
@@ -125,6 +132,14 @@ def supplier_rankings(
             filters + "; category = INSUFFICIENT_EVIDENCE",
             w.label,
             "listed separately with their missing reasons",
+        ),
+        "unranked_suppliers": counted(
+            len(unranked),
+            len(rows),
+            filters + "; INSUFFICIENT_EVIDENCE or overall_score missing",
+            w.label,
+            "listed in the insufficient_evidence table with their reasons; ranked + unranked "
+            "= window_suppliers",
         ),
         "mean_overall_ranked": metric(
             _mean([r[3] for r in ranked]),
@@ -222,7 +237,7 @@ def missing_data_rates(session: Session) -> dict[str, Any]:
         }
 
     metrics = {
-        "overall": rates(rows, "all six scorecard windows"),
+        "overall": rates(rows, f"all {len(by_window)} scorecard windows"),
         "by_window": {iso(c): rates(g, windows[c].label) for c, g in sorted(by_window.items())},
     }
     return report("missing_data_rates", "Missing-data rates per component", metrics)
@@ -284,7 +299,7 @@ def deteriorating_suppliers(session: Session, *, threshold: Any) -> dict[str, An
             "latest-window non-insufficient suppliers without a usable previous-window score",
             window,
         ),
-        "quarter_over_quarter_delta": {
+        "window_over_window_delta": {
             k: metric(None if v is None else float(v), None, None, filters, window, spread)
             for k, v in stats.items()
         },
@@ -420,7 +435,7 @@ def compliance_exceptions(session: Session) -> dict[str, Any]:
     )
 
 
-def disruption_exposure(session: Session, top: int = 20) -> dict[str, Any]:
+def disruption_exposure(session: Session, *, lookback_days: int, top: int = 20) -> dict[str, Any]:
     """Latest window: the deduplicated risk signals that fed each supplier's disruption score
     (stored in the score explanation), by severity, and the most exposed suppliers."""
     w = latest_window(session)
@@ -451,7 +466,8 @@ def disruption_exposure(session: Session, top: int = 20) -> dict[str, Any]:
                 len(signals),
                 f"{filters}; severity = {sev.value}",
                 w.label,
-                "signals quarantined or outside the 180-day lookback never reach the score",
+                f"signals quarantined or outside the {lookback_days}-day lookback never "
+                "reach the score",
             )
             for sev in Severity
         },

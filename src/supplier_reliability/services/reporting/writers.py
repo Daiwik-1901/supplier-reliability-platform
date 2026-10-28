@@ -22,6 +22,13 @@ def _default(value: Any) -> Any:
     raise TypeError(f"not JSON serialisable: {type(value).__name__}")
 
 
+def _escape(text: str) -> str:
+    """Escape for a Markdown table cell or heading: backslash first, then pipe; newlines
+    become spaces."""
+    text = text.replace("\\", "\\\\").replace("|", "\\|")
+    return " ".join(text.splitlines()) if "\n" in text or "\r" in text else text
+
+
 def _cell(value: Any) -> str:
     if value is None:
         return ""
@@ -33,7 +40,7 @@ def _cell(value: Any) -> str:
         text = json.dumps(value, sort_keys=True, ensure_ascii=False, default=_default)
     else:
         text = str(value)
-    return text.replace("|", "\\|").replace("\n", " ")
+    return _escape(text)
 
 
 def _flatten(node: dict[str, Any], path: tuple[str, ...] = ()):
@@ -45,7 +52,8 @@ def _flatten(node: dict[str, Any], path: tuple[str, ...] = ()):
 
 
 def _table(headers: list[str], rows: list[list[str]]) -> list[str]:
-    lines = ["| " + " | ".join(headers) + " |", "| " + " | ".join("---" for _ in headers) + " |"]
+    head = [_escape(h) for h in headers]
+    lines = ["| " + " | ".join(head) + " |", "| " + " | ".join("---" for _ in head) + " |"]
     lines += ["| " + " | ".join(r) + " |" for r in rows]
     return lines
 
@@ -64,7 +72,7 @@ def render_markdown(payload: dict[str, Any]) -> str:
         rows = [[_cell(name), *(_cell(m[k]) for k in METRIC_KEYS)] for name, m in metrics]
         lines += ["## Metrics", "", *_table(["metric", *METRIC_KEYS], rows), ""]
     for name, rows in payload.get("tables", {}).items():
-        lines += [f"## {name}", ""]
+        lines += [f"## {_escape(str(name))}", ""]
         if not rows:
             lines += ["_none_", ""]
             continue

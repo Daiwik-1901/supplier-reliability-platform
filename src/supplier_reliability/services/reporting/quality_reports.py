@@ -68,7 +68,7 @@ def data_quality(session: Session, validation_run_id: str) -> dict[str, Any]:
             }
         )
     d_filter = "findings of the run with severity MEDIUM, HIGH or CRITICAL"
-    i_filter = "findings of the run with severity LOW (informational, not a defect)"
+    i_filter = "findings of the run with severity LOW or NONE (informational, not a defect)"
     note = "findings are persisted rows; nothing is missing by construction"
 
     def counts(values: dict[str, int], filters: str, label: str) -> dict[str, Any]:
@@ -88,7 +88,8 @@ def data_quality(session: Session, validation_run_id: str) -> dict[str, Any]:
         },
         "expected_anomalies": count_metric(
             expected,
-            "findings with is_expected_anomaly = true (defects and informational)",
+            "of which expected anomalies: subset of the defect and informational findings "
+            "above (is_expected_anomaly = true), not an additional group",
             window,
             note,
         ),
@@ -104,7 +105,10 @@ def data_quality(session: Session, validation_run_id: str) -> dict[str, Any]:
         "Data-quality findings",
         metrics,
         {"run": [run_row], "findings_by_rule_and_severity": table},
-        ["Defects (MEDIUM+) and informational (LOW) findings are reported separately."],
+        [
+            "Defects (MEDIUM+) and informational (LOW or NONE) findings are reported "
+            "separately; expected anomalies are a subset of both."
+        ],
     )
 
 
