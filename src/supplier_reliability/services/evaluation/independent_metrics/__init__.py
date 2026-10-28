@@ -2,9 +2,32 @@
 
 A deliberately separate implementation of D5 eligibility, the six D6 components and the D7
 overall/category, written with pandas over `export_tables` output. It imports nothing from the
-project (enforced by tests/unit/test_anomaly_eval.py): only the scoring parameters, passed in as
-a plain dict (`ScoringConfig.model_dump(mode="json")` or a stored config snapshot), are shared
-with the engine. Decisions are not recomputed (they depend on data exceptions).
+project and has no database access (enforced by tests/unit/test_anomaly_eval.py): only the
+scoring parameters, passed in as a plain dict (`ScoringConfig.model_dump(mode="json")` or a
+stored config snapshot), are shared with the engine. Decisions are not recomputed (they depend
+on data exceptions).
+
+What is and is not independent (stated plainly; docs/ copies this list):
+- INDEPENDENT of the engine: the data access and the arithmetic. Everything is read from the
+  exported CSVs (no SQL, no ORM, no engine query); joins and allocation paths (inspection ->
+  shipment_line -> shipment -> PO -> supplier, requirement -> contract -> supplier) are rebuilt
+  here; the disruption dedup key is recomputed from (supplier, site, type, observed date) instead
+  of reading the stored dedup_key; cost uses the stored variance_amount where the engine uses
+  invoiced - expected; fractional days, sums and roundings are recomputed in Decimal. So a wrong
+  query, join, stored derived column or arithmetic slip in the engine shows up as a mismatch.
+- TRANSCRIBED from the engine's documented interpretation (evidence.py), and therefore NOT
+  cross-checked by reconciliation (a wrong reading of the rule would be wrong in both):
+  - capacity: the expansion of a declaration to the window months it overlaps, and the
+    per-(supplier, month) scope cells (site-level rows of any verification status override
+    supplier-wide rows);
+  - compliance: the certification state mapping (incl. R19 "not yet valid -> UNKNOWN") and the
+    supersession scan (current = latest by (recorded_at, id) among rows recorded <= C that no
+    row recorded <= C supersedes);
+  - disruption: site_active as of date(C) (effective dates; open-ended -> site_status ACTIVE);
+  - delivery: the correction loop (first ARRIVED by (recorded, id); latest valid
+    event_timestamp CORRECTION recorded <= C wins; unparseable/naive ones skipped);
+  - compliance requirements count only on a contract effective at date(C) and not DRAFT.
+  These are checked against hand-calculated expectations (Task 9/10/12b tests), not here.
 
 Arithmetic is Decimal from the CSV text (never float), except the disruption recency decay, which
 uses `Decimal(str(math.exp(...)))` exactly as D6 prescribes. Component scores are clamped and

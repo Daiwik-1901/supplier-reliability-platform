@@ -11,7 +11,13 @@ Evaluation unit: one raw record per issue class ("raw_record_per_issue_class"). 
 - TP = positive and predicted; FN = positive, not predicted; FP = predicted, not positive (any
   record); TN = negative-population records without a prediction of k.
 `micro` sums the per-class counts. `decision_agreement[k]` compares, for each TP, the ground
-truth's expected_decision with the exception's disposition.
+truth's expected_decision with the exception's disposition; if a record had several exceptions
+of class k (impossible today: data_exceptions is unique per batch, record and issue type) it
+agrees when ANY of them matches, and it is counted once.
+
+Precision, recall and F1 are None when undefined: precision with no predictions, recall with no
+positives, and F1 (the harmonic mean of P and R) whenever P or R is None. With P = R = 0 the F1
+is 0.0.
 
 This is the evaluation layer: it may read ground truth. Scoring, validation and detection must
 never import it (services/isolation.py).
@@ -27,7 +33,13 @@ from sqlalchemy.orm import Session
 from supplier_reliability.domain.enums import IssueType
 from supplier_reliability.models import DataException, RawIngestionRecord
 
-__all__ = ["UNIT", "AnomalyEvaluation", "ConfusionCounts", "evaluate_anomalies"]
+__all__ = [
+    "UNIT",
+    "AnomalyEvaluation",
+    "ConfusionCounts",
+    "agreement_counts",
+    "evaluate_anomalies",
+]
 
 UNIT = "raw_record_per_issue_class"
 ENTITY_OF_CLASS: dict[IssueType, str] = {
@@ -60,7 +72,10 @@ class ConfusionCounts:
 
     @property
     def f1(self) -> float | None:
-        """2PR / (P + R) = 2TP / (2TP + FP + FN); None when there is nothing to judge."""
+        """Harmonic mean 2PR / (P + R) (= 2TP / (2TP + FP + FN)); None when P or R is None,
+        0.0 when both are 0."""
+        if self.precision is None or self.recall is None:
+            return None
         return _ratio(2 * self.tp, 2 * self.tp + self.fp + self.fn)
 
     def __add__(self, other: "ConfusionCounts") -> "ConfusionCounts":
@@ -101,6 +116,15 @@ def _ground_truth(path: Path, raw_ids: set[str]) -> dict[IssueType, dict[str, st
     return out
 
 
+def agreement_counts(
+    truth: dict[str, str], predicted: dict[str, list[str | None]], records: set[str]
+) -> dict[str, int]:
+    """{"agree", "disagree"} over `records` (the TPs): a record agrees when ANY of its predicted
+    dispositions equals the ground truth's expected_decision; each record counts once."""
+    agree = sum(truth[r] in predicted[r] for r in records)
+    return {"agree": agree, "disagree": len(records) - agree}
+
+
 def evaluate_anomalies(
     session: Session, batch_id: str, ground_truth_path: Path
 ) -> AnomalyEvaluation:
@@ -113,13 +137,14 @@ def evaluate_anomalies(
     if not records:
         raise ValueError(f"unknown or empty raw batch {batch_id!r}")
     truth = _ground_truth(ground_truth_path, {r.raw_record_id for r in records})
-    predicted: dict[IssueType, dict[str, str | None]] = {i: {} for i in IssueType}
+    predicted: dict[IssueType, dict[str, list[str | None]]] = {i: {} for i in IssueType}
     for raw_id, issue, disposition in session.execute(
-        sa.select(
-            DataException.raw_record_id, DataException.issue_type, DataException.disposition
-        ).where(DataException.batch_id == batch_id)
+        sa.select(DataException.raw_record_id, DataException.issue_type, DataException.disposition)
+        .where(DataException.batch_id == batch_id)
+        .order_by(DataException.exception_id)
     ):
-        predicted[IssueType(issue)][raw_id] = None if disposition is None else str(disposition)
+        dispositions = predicted[IssueType(issue)].setdefault(raw_id, [])
+        dispositions.append(None if disposition is None else str(disposition))
 
     per_class: dict[IssueType, ConfusionCounts] = {}
     negatives: dict[IssueType, int] = {}
@@ -135,7 +160,6 @@ def evaluate_anomalies(
             tn=len(negative - hits),
         )
         negatives[issue] = len(negative)
-        agree = sum(truth[issue][r] == predicted[issue][r] for r in tp)
-        agreement[issue] = {"agree": agree, "disagree": len(tp) - agree}
+        agreement[issue] = agreement_counts(truth[issue], predicted[issue], tp)
     micro = sum(per_class.values(), ConfusionCounts(0, 0, 0, 0))
     return AnomalyEvaluation(per_class, micro, negatives, agreement)

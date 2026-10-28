@@ -3,6 +3,7 @@ import rule that keeps the independent recomputation independent of the engine."
 
 import ast
 import csv
+import sys
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -21,6 +22,7 @@ from supplier_reliability.services.evaluation import (
     ConfusionCounts,
     evaluate_anomalies,
 )
+from supplier_reliability.services.evaluation.anomaly_eval import agreement_counts
 
 BATCH = "BATCH-UNIT"
 AT = datetime(2026, 7, 1, tzinfo=UTC)
@@ -61,9 +63,17 @@ def test_zero_denominators_return_none():
     no_predictions = ConfusionCounts(tp=0, fp=0, fn=3, tn=7)
     assert no_predictions.precision is None  # nothing predicted: precision undefined, not 0 or 1
     assert no_predictions.recall == 0.0
+    assert no_predictions.f1 is None  # F1 = harmonic mean of P and R: undefined with P
     no_positives = ConfusionCounts(tp=0, fp=2, fn=0, tn=7)
     assert no_positives.recall is None
     assert no_positives.precision == 0.0
+    assert no_positives.f1 is None  # undefined with R
+
+
+def test_f1_is_zero_when_precision_and_recall_are_both_zero():
+    both_zero = ConfusionCounts(tp=0, fp=1, fn=1, tn=0)
+    assert (both_zero.precision, both_zero.recall) == (0.0, 0.0)
+    assert both_zero.f1 == 0.0  # both defined: the harmonic-mean limit, not undefined
 
 
 def test_confusion_counts_add_up():
@@ -181,6 +191,22 @@ def test_decision_agreement_compares_disposition_with_expected_decision(unit_bat
     assert ev.decision_agreement[B] == {"agree": 0, "disagree": 0}  # missed: nothing to compare
 
 
+def test_decision_agreement_counts_a_record_once_if_any_duplicate_matches():
+    """Several exceptions of one class for one raw record (impossible today: unique per batch,
+    record and issue type) count as ONE agreement if any disposition matches."""
+    truth = {"RAW-1": "QUARANTINED", "RAW-2": "QUARANTINED", "RAW-3": "CORRECTED"}
+    predicted = {
+        "RAW-1": ["REJECTED", "QUARANTINED"],  # the second matches
+        "RAW-2": ["REJECTED", "REJECTED"],
+        "RAW-3": ["CORRECTED"],
+    }
+    assert agreement_counts(truth, predicted, {"RAW-1", "RAW-2", "RAW-3"}) == {
+        "agree": 2,
+        "disagree": 1,
+    }
+    assert agreement_counts(truth, predicted, {"RAW-2"}) == {"agree": 0, "disagree": 1}
+
+
 def test_unknown_batch_raises(unit_batch):
     session, gt = unit_batch
     with pytest.raises(ValueError, match="batch"):
@@ -230,16 +256,30 @@ def _imports(path: Path, module: str, is_init: bool) -> list[tuple[int, str]]:
     return out
 
 
+ALLOWED_THIRD_PARTY = frozenset({"pandas", "numpy"})
+REJECTED_TOP_LEVEL = frozenset({"sqlalchemy", "sqlite3"})  # no database access: CSVs only
+ALLOWED_PROJECT_EXTRA = "supplier_reliability.config"
+
+
 def _offending(name: str) -> bool:
     if any(f in name for f in FORBIDDEN):
         return True
-    return name.startswith("supplier_reliability") and not name.startswith(ALLOWED_PROJECT_MODULES)
+    top = name.split(".")[0]
+    if top in REJECTED_TOP_LEVEL:
+        return True
+    if top == "supplier_reliability":
+        return not (
+            name.startswith(ALLOWED_PROJECT_MODULES)
+            or name == ALLOWED_PROJECT_EXTRA
+            or name.startswith(ALLOWED_PROJECT_EXTRA + ".")
+        )
+    return top not in ALLOWED_THIRD_PARTY and top not in sys.stdlib_module_names
 
 
 def test_independent_metrics_imports_nothing_from_the_engine():
-    """The recomputation may use stdlib, pandas and numpy plus its own modules only: nothing from
-    scoring, validation or detection (or any other project module), so it cannot share a bug
-    with the code it checks."""
+    """The recomputation may use the stdlib (minus sqlite3), pandas and numpy, its own modules
+    and supplier_reliability.config only: nothing from scoring, validation or detection, no
+    database access, so it cannot share a bug or a data path with the code it checks."""
     files = sorted(PACKAGE.rglob("*.py"))
     assert files, "independent_metrics package not found"
     offending = []
@@ -265,9 +305,17 @@ def test_import_rule_catches_a_forbidden_import(tmp_path):
         "from ...validation import rules_domain\n"
         "from supplier_reliability.services import anomaly_detection\n"
         "from supplier_reliability.models import Shipment\n"
-        "MOD = 'supplier_reliability.services.scoring.evidence'\n",
+        "MOD = 'supplier_reliability.services.scoring.evidence'\n"
+        "import sqlalchemy\n"
+        "import sqlite3\n"
+        "from sqlalchemy.orm import Session\n"
+        "import yaml\n"
+        "import numpy as np\n"
+        "from supplier_reliability.config import ScoringConfig\n"
+        "import json, math\n",
         encoding="utf-8",
     )
     module = f"{ALLOWED_PROJECT_MODULES[0]}.bad"
     flagged = sorted({line for line, n in _imports(bad, module, False) if _offending(n)})
-    assert flagged == [3, 4, 5, 6, 7]  # pandas and the package's own module are allowed
+    # allowed: pandas, the package's own module, numpy, supplier_reliability.config, stdlib
+    assert flagged == [3, 4, 5, 6, 7, 8, 9, 10, 11]

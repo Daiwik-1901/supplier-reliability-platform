@@ -5,14 +5,19 @@ score (site_id NULL; CORRECTED and any other calculation status alike) whose (st
 cutoff) equals one of `windows`. Each is compared with `independent_supplier_metrics` computed
 from the CSVs in `export_dir` with the score's own stored ScoringConfigSnapshot (so a score is
 judged by the parameters it claims, and the config itself is never re-read from the engine):
-the six component scores (missing must match missing), overall_score and reliability_category.
+the six component scores (missing must match missing), overall_score, evidence_coverage and
+reliability_category. It also works in the other direction: every (supplier, window) the
+recomputation has a row for (every supplier in suppliers.csv) but that has no current persisted
+score is listed in `missing_persisted`.
 
-Tolerance: component scores are compared EXACTLY except the fields in TOLERANT_FIELDS, where the
-two implementations take a different route to the same formula and may differ in the last kept
-digit of a 28-digit Decimal before rounding (delivery: fractional-day sums; disruption: float
-exp() with summation order), which can flip a 2-dp half-up rounding at an exact ...5 boundary;
-overall inherits that. There `|persisted - independent| <= tolerance` (default 0.01) matches.
-Category is compared exactly. The export must reflect the data the scores were computed from.
+Tolerance: evidence_coverage, category and the quality / cost / capacity / compliance scores are
+always compared EXACTLY. `tolerance` applies only to TOLERANT_FIELDS, where the two
+implementations take a different route to the same formula and could in principle differ in the
+last kept digit of a 28-digit Decimal before rounding (delivery: fractional-day sums;
+disruption: float exp() and summation order), flipping a 2-dp half-up rounding at an exact ...5
+boundary; overall inherits that. The API default is 0.01 for that reason only. On the generated
+data the agreement is exact: the tests pin `tolerance=Decimal(0)` (starter and full scale).
+The export must reflect the data the scores were computed from.
 
 `profile_alignment(session, profiles_path)` tabulates the latest window's categories per
 generator profile: a SANITY CHECK, NOT ACCURACY (profiles are generator intent, not truth).
@@ -56,14 +61,20 @@ class ReconciliationReport:
     checked: int = 0
     matched: int = 0
     mismatches: list[dict[str, Any]] = field(default_factory=list)
-    # component name / "overall" / "category" -> number of mismatched scores
+    # component name / "overall" / "coverage" / "category" -> number of mismatched scores
     component_mismatch_counts: dict[str, int] = field(default_factory=dict)
     by_status: dict[str, int] = field(default_factory=dict)  # checked scores per status
+    # (supplier, window) pairs recomputed independently but without a current persisted score
+    missing_persisted: list[dict[str, Any]] = field(default_factory=list)
     tolerance: Decimal = Decimal("0.01")
 
 
 def _iso(value: Any) -> str:
     return value.isoformat().replace("+00:00", "Z")
+
+
+def _window(w: WindowLike) -> dict[str, str]:
+    return {"start": _iso(w.start), "end": _iso(w.end), "cutoff": _iso(w.cutoff)}
 
 
 def _text(value: Any) -> str | None:
@@ -107,8 +118,15 @@ def reconcile_scores(
     configs: dict[str, dict] = {}
     for w in windows:
         by_config: dict[str, list[SupplierScore]] = defaultdict(list)
+        persisted: set[str] = set()
         for score in _current_scores(session, w):
             by_config[score.config_hash].append(score)
+            persisted.add(score.supplier_id)
+        report.missing_persisted.extend(
+            {"supplier_id": sid, "window": _window(w)}
+            for sid in tables.supplier_ids
+            if sid not in persisted
+        )
         for config_hash, scores in sorted(by_config.items()):
             if config_hash not in configs:
                 snapshot = session.get(ScoringConfigSnapshot, config_hash)
@@ -137,7 +155,7 @@ def _compare(
     base = {
         "score_id": score.score_id,
         "supplier_id": score.supplier_id,
-        "window": {"start": _iso(w.start), "end": _iso(w.end), "cutoff": _iso(w.cutoff)},
+        "window": _window(w),
     }
     if row is None:
         return [base | {"field": "supplier_id", "component": "supplier",
@@ -155,6 +173,16 @@ def _compare(
                     "independent": _text(independent),
                 }
             )
+    if not _same("evidence_coverage", score.evidence_coverage, row["evidence_coverage"], tolerance):
+        out.append(
+            base
+            | {
+                "field": "evidence_coverage",
+                "component": "coverage",
+                "persisted": _text(score.evidence_coverage),
+                "independent": _text(row["evidence_coverage"]),
+            }
+        )
     persisted_category = str(score.reliability_category)
     if persisted_category != row["reliability_category"]:
         out.append(
