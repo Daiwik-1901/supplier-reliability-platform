@@ -28,3 +28,26 @@ class GeneratedDataset:
     risk_signals: Rows = field(default_factory=list)
     # Ground truth only: never copied into supplier rows.
     supplier_profiles: dict[str, str] = field(default_factory=dict)
+
+
+def generate_dataset(cfg: GeneratorConfig) -> GeneratedDataset:
+    """Generate every table, parents first (spec section 7.4): master data -> orders, shipments
+    and events -> inspections and invoices -> risk signals. Deterministic in ``cfg``."""
+    # Local imports: every stage module imports GeneratedDataset from this module.
+    from supplier_reliability.services.generator.ids import IdRegistry
+    from supplier_reliability.services.generator.master_data import generate_master_data
+    from supplier_reliability.services.generator.quality_finance import (
+        generate_inspections_and_invoices,
+    )
+    from supplier_reliability.services.generator.risk import generate_risk_signals
+    from supplier_reliability.services.generator.rng import RandomSource
+    from supplier_reliability.services.generator.transactions import (
+        generate_orders_and_shipments,
+    )
+
+    rs, ids, ds = RandomSource(cfg.seed), IdRegistry(), GeneratedDataset(config=cfg)
+    generate_master_data(cfg, rs, ids, ds)
+    generate_orders_and_shipments(cfg, rs, ids, ds)
+    generate_inspections_and_invoices(cfg, rs, ids, ds)
+    generate_risk_signals(cfg, rs, ids, ds)
+    return ds
