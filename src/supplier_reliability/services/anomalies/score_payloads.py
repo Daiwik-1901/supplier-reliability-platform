@@ -19,7 +19,7 @@ None here; the injector assigns the neutral SCORE-RAW id after shuffling (R38).
 
 from collections import defaultdict
 from collections.abc import Iterable
-from datetime import date, datetime, timedelta
+from datetime import datetime, timedelta
 from typing import Any
 
 import numpy as np
@@ -30,13 +30,6 @@ from supplier_reliability import __version__
 from supplier_reliability.config import ScoringConfig
 from supplier_reliability.domain.numeric import ensure_utc
 from supplier_reliability.models import (
-    DeliveryEvent,
-    Inspection,
-    Invoice,
-    POLine,
-    PurchaseOrder,
-    RiskSignal,
-    Shipment,
     SupplierScore,
 )
 from supplier_reliability.services.anomalies.sampling import Picker, format_ts
@@ -55,6 +48,7 @@ from supplier_reliability.services.scoring.service import (
     evaluation_key,
     scoring_config_hash,
 )
+from supplier_reliability.services.validation.source_times import after_cutoff, load_source_times
 
 LEAKAGE_HORIZON = timedelta(days=90)
 SELF_ID = "<self>"  # placeholder in rationales for the payload's (later assigned) natural id
@@ -97,49 +91,17 @@ def evidence_refs(result: ScoreResult) -> list[dict[str, str]]:
 
 
 def records_after(session: Session, refs: Iterable[dict[str, str]], cutoff: datetime) -> list[str]:
-    """Cited ids whose canonical occurrence or recording time is after `cutoff`."""
-    wanted: dict[str, list[str]] = defaultdict(list)
+    """Cited ids whose canonical occurrence or recording time is after `cutoff`, by the per-entity
+    times CH-005 and the leakage detector use (SOURCE_TIMES)."""
+    wanted: dict[str, set[str]] = defaultdict(set)
     for ref in refs:
-        wanted[ref["source_entity_type"]].append(ref["source_record_id"])
-    queries = {  # entity -> (id, occurrence, recording)
-        "shipment": (
-            Shipment.shipment_id,
-            Shipment.expected_delivery_timestamp,
-            Shipment.created_at,
-        ),
-        "delivery_event": (
-            DeliveryEvent.delivery_event_id,
-            DeliveryEvent.event_timestamp,
-            DeliveryEvent.recorded_timestamp,
-        ),
-        "inspection": (
-            Inspection.inspection_id,
-            Inspection.inspection_timestamp,
-            Inspection.recorded_at,
-        ),
-        "invoice": (Invoice.invoice_id, Invoice.invoice_date, Invoice.recorded_at),
-        "risk_signal": (
-            RiskSignal.risk_signal_id,
-            RiskSignal.observed_timestamp,
-            RiskSignal.recorded_timestamp,
-        ),
-        "po_line": (POLine.po_line_id, PurchaseOrder.order_date, POLine.created_at),
-    }
-
-    def after(value: datetime | date) -> bool:
-        if isinstance(value, datetime):
-            return ensure_utc(value) > cutoff
-        return value > cutoff.date()
-
-    late: list[str] = []
-    for entity, (id_col, occurred, recorded) in queries.items():
-        if not wanted.get(entity):
-            continue
-        stmt = sa.select(id_col, occurred, recorded).where(id_col.in_(wanted[entity]))
-        if entity == "po_line":
-            stmt = stmt.join(PurchaseOrder, PurchaseOrder.po_id == POLine.po_id)
-        late.extend(r[0] for r in session.execute(stmt) if after(r[1]) or after(r[2]))
-    return sorted(late)
+        wanted[ref["source_entity_type"]].add(ref["source_record_id"])
+    times = load_source_times(session, wanted)
+    return sorted(
+        record_id
+        for (_, record_id), values in times.items()
+        if any(v is not None and after_cutoff(v, cutoff) for _, v in values)
+    )
 
 
 def score_payload(

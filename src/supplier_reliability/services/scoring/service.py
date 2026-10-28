@@ -29,6 +29,9 @@ commits a caller's unrelated half-done work.
   "evidence": {component: {"added": [...], "removed": [...]}}.
 - score_history: `calculate` for every supplier per window with calculated_at = cutoff + 1 day
   (the config snapshot, if created, gets the first window's calculated_at too).
+- stage_corrected (Task 15) is the one exception to "owns the transaction": it writes a
+  CORRECTED score (leakage correction) inside the caller's transaction (detect_raw_batch), so
+  the correction and its data exception commit together. It flushes and never commits.
 
 Score ids SCORE-2026-NNNNNN come from max(existing) + 1, read once inside the transaction. That is
 safe on SQLite (single writer). Concurrent writers on PostgreSQL would need a sequence or a retry
@@ -62,6 +65,7 @@ from collections.abc import Callable, Iterable, Sequence
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timedelta
 from decimal import Decimal
+from enum import StrEnum
 from typing import Any
 
 import sqlalchemy as sa
@@ -166,6 +170,14 @@ class CalculationOutcome:
     superseded: dict[str, str] = field(default_factory=dict)  # old score_id -> new score_id
 
 
+class CorrectionOutcome(StrEnum):
+    """What `stage_corrected` did (stored in the leakage exception's evidence)."""
+
+    EXISTING = "eligible canonical score already exists"
+    INSERTED = "corrected score inserted"
+    SUPERSEDED = "stale current score superseded"
+
+
 @dataclass(frozen=True)
 class _NewScore:
     supplier_id: str
@@ -175,6 +187,7 @@ class _NewScore:
     version: int = 1
     change_reason: str | None = None
     restates: SupplierScore | None = None
+    status: CalculationStatus | None = None  # None: derived from the result
 
 
 def calculation_status(result: ScoreResult) -> CalculationStatus:
@@ -221,6 +234,49 @@ class ScoringService:
                 self._calculate(w, None, w.cutoff + timedelta(days=1), out)
 
         return self._transaction(work)
+
+    def stage_corrected(
+        self, window: EvaluationWindow, supplier_id: str, reason: str
+    ) -> tuple[str, CorrectionOutcome]:
+        """The eligible-evidence score for (supplier, window) as a leakage correction (Task 15,
+        Ruling R4), inside the CALLER's transaction: it flushes and never commits (the caller,
+        `detect_raw_batch`, commits or rolls back). Returns (score_id, outcome):
+        - EXISTING: the current score for the evaluation key already has the fresh evidence
+          fingerprint; nothing is written.
+        - INSERTED: no current score for the key; version 1 is inserted with
+          calculation_status CORRECTED.
+        - SUPERSEDED: the current score's fingerprint differs; version + 1 (CORRECTED) supersedes
+          it in the schema-enforced order, as `recalculate` does.
+        Scores, lineage and snapshot are written by the same `_insert` as every other score."""
+        self._check_version(None)
+        self._next_number = None
+        ids = self._supplier_ids([supplier_id])
+        key = self._keys(ids, window)[supplier_id]
+        old = self._current([key]).get(key)
+        bundle, result = self._score(ids, window)[supplier_id]
+        if old is not None and old.evidence_fingerprint == result.evidence_fingerprint:
+            return old.score_id, CorrectionOutcome.EXISTING
+        corrected = CalculationStatus.CORRECTED
+        if old is None:
+            new = _NewScore(supplier_id, key, bundle, result, 1, reason, status=corrected)
+            return self._insert([new], self.clock())[0], CorrectionOutcome.INSERTED
+        restated = self._by_id([old.restates_score_id] if old.restates_score_id else [])
+        new = _NewScore(
+            supplier_id,
+            key,
+            bundle,
+            result,
+            old.version_number + 1,
+            reason,
+            restated.get(old.restates_score_id or ""),
+            corrected,
+        )
+        old.is_current = False
+        self.session.flush()
+        (new_id,) = self._insert([new], self.clock())
+        old.superseded_by_score_id = new_id
+        self.session.flush()
+        return new_id, CorrectionOutcome.SUPERSEDED
 
     # -- transaction plumbing ------------------------------------------------------------------
 
@@ -466,7 +522,7 @@ class ScoringService:
             "is_provisional": r.overall.is_provisional,
             "reliability_category": r.overall.category,
             "decision": r.overall.decision,
-            "calculation_status": calculation_status(r),
+            "calculation_status": n.status or calculation_status(r),
             "effective_weights": {k: str(v) for k, v in r.overall.effective_weights.items()},
             "explanation": explanation,
             "scoring_version": self.cfg.scoring_version,

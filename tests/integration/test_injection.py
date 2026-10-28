@@ -19,8 +19,6 @@ from sqlalchemy.orm import Session
 from supplier_reliability.database import (
     make_engine,
     make_session_factory,
-    run_migrations,
-    session_scope,
 )
 from supplier_reliability.domain.enums import DeliveryEventType, Disposition, IssueType, Severity
 from supplier_reliability.domain.numeric import ensure_utc
@@ -51,11 +49,8 @@ from supplier_reliability.services.generator.config import (
     GeneratorConfig,
 )
 from supplier_reliability.services.generator.dataset import generate_dataset
-from supplier_reliability.services.generator.loader import load_dataset
 from supplier_reliability.services.generator.rng import RandomSource
 from supplier_reliability.services.isolation import find_ground_truth_references
-from supplier_reliability.services.scoring.evidence import scorecard_windows
-from supplier_reliability.services.scoring.service import ScoringService
 from supplier_reliability.services.validation.payloads import validate_payload
 
 NOW = datetime(2026, 10, 1, 12, 0, tzinfo=UTC)
@@ -83,41 +78,11 @@ EXPECTED = {  # issue type -> (severity, expected decision)
 
 
 @pytest.fixture(scope="session")
-def gen_cfg(app_config) -> GeneratorConfig:
-    return GeneratorConfig.from_app_config(app_config, "starter")
-
-
-@pytest.fixture(scope="session")
 def profiles(gen_cfg) -> dict[str, str]:
     return dict(generate_dataset(gen_cfg).supplier_profiles)
 
 
-@pytest.fixture(scope="session")
-def loaded_starter_db(gen_cfg, tmp_path_factory) -> Path:
-    """Starter dataset loaded but NOT scored (built once)."""
-    path = tmp_path_factory.mktemp("injection-loaded") / "loaded.db"
-    url = f"sqlite:///{path}"
-    run_migrations(url)
-    engine = make_engine(url)
-    with session_scope(make_session_factory(engine)) as s:
-        load_dataset(s, generate_dataset(gen_cfg))
-    engine.dispose()
-    return path
-
-
-@pytest.fixture(scope="session")
-def scored_starter_db(app_config, gen_cfg, loaded_starter_db, tmp_path_factory) -> Path:
-    """loaded_starter_db scored for every scorecard window (built once)."""
-    path = tmp_path_factory.mktemp("injection") / "scored.db"
-    shutil.copyfile(loaded_starter_db, path)
-    engine = make_engine(f"sqlite:///{path}")
-    windows = scorecard_windows(
-        gen_cfg.reference_start, gen_cfg.reference_end, app_config.scoring.window_months
-    )
-    with make_session_factory(engine)() as s:
-        ScoringService(s, app_config.scoring, lambda: NOW).score_history(windows)
-    engine.dispose()
-    return path
+# gen_cfg, loaded_starter_db and scored_starter_db come from tests/integration/conftest.py
 
 
 def _open(src: Path, target: Path) -> Iterator[Session]:
@@ -593,7 +558,12 @@ def test_leaky_score_cites_post_cutoff_evidence(injected, gen_cfg):
 
 @pytest.mark.parametrize(
     "package",
-    ["supplier_reliability.services.scoring", "supplier_reliability.services.validation"],
+    [
+        "supplier_reliability.services.scoring",
+        "supplier_reliability.services.validation",
+        "supplier_reliability.services.anomaly_detection",
+        "supplier_reliability.repositories.exceptions",
+    ],
 )
 def test_ground_truth_not_importable_from_scoring(package):
     assert find_ground_truth_references(package) == []

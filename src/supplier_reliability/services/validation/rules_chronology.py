@@ -22,12 +22,8 @@ from supplier_reliability.domain.enums import (
     validate_sequence,
 )
 from supplier_reliability.models import (
-    CapacityDeclaration,
-    ComplianceRequirement,
     DeliveryEvent,
     Inspection,
-    Invoice,
-    POLine,
     PurchaseOrder,
     RiskSignal,
     ScoreEvidence,
@@ -38,6 +34,7 @@ from supplier_reliability.models import (
 )
 from supplier_reliability.services.validation.framework import RuleCheck, Violation, rule
 from supplier_reliability.services.validation.rules_integrity import count
+from supplier_reliability.services.validation.source_times import SOURCE_TIMES, after_cutoff
 
 _HIGH = {"category": "chronology", "severity": Severity.HIGH}
 E = DeliveryEventType
@@ -205,84 +202,7 @@ def ch_004(session: Session) -> RuleCheck:
 
 
 # --- CH-005 -------------------------------------------------------------------------------------
-
-# lineage entity type -> (model, pk column, [(label, time column)], extra outer joins)
-_PO = aliased(PurchaseOrder)
-_SOURCES: dict[str, tuple[Any, Any, list[tuple[str, Any]], list[tuple[Any, Any]]]] = {
-    "shipment": (
-        Shipment,
-        Shipment.shipment_id,
-        [
-            ("expected_delivery_timestamp", Shipment.expected_delivery_timestamp),
-            ("created_at", Shipment.created_at),
-        ],
-        [],
-    ),
-    "delivery_event": (
-        DeliveryEvent,
-        DeliveryEvent.delivery_event_id,
-        [
-            ("event_timestamp", DeliveryEvent.event_timestamp),
-            ("recorded_timestamp", DeliveryEvent.recorded_timestamp),
-        ],
-        [],
-    ),
-    "inspection": (
-        Inspection,
-        Inspection.inspection_id,
-        [
-            ("inspection_timestamp", Inspection.inspection_timestamp),
-            ("recorded_at", Inspection.recorded_at),
-        ],
-        [],
-    ),
-    "invoice": (
-        Invoice,
-        Invoice.invoice_id,
-        [("invoice_date", Invoice.invoice_date), ("recorded_at", Invoice.recorded_at)],
-        [],
-    ),
-    "po_line": (
-        POLine,
-        POLine.po_line_id,
-        [
-            ("created_at", POLine.created_at),
-            ("purchase_order.order_date", _PO.order_date),
-            ("purchase_order.created_at", _PO.created_at),
-        ],
-        [(_PO, _PO.po_id == POLine.po_id)],
-    ),
-    "capacity_declaration": (
-        CapacityDeclaration,
-        CapacityDeclaration.capacity_declaration_id,
-        [("recorded_at", CapacityDeclaration.recorded_at)],
-        [],
-    ),
-    "compliance_requirement": (
-        ComplianceRequirement,
-        ComplianceRequirement.requirement_id,
-        [
-            ("created_at", ComplianceRequirement.created_at),
-            ("effective_from", ComplianceRequirement.effective_from),  # DATE: day granularity
-        ],
-        [],
-    ),
-    "supplier_certification": (
-        SupplierCertification,
-        SupplierCertification.certification_id,
-        [("recorded_at", SupplierCertification.recorded_at)],
-        [],
-    ),
-    "risk_signal": (
-        RiskSignal,
-        RiskSignal.risk_signal_id,
-        [
-            ("observed_timestamp", RiskSignal.observed_timestamp),
-            ("recorded_timestamp", RiskSignal.recorded_timestamp),
-        ],
-        [],
-    ),
-}
+# Per-entity times: SOURCE_TIMES (source_times.py), shared with the Task 15 leakage detector.
 
 
 def _leak(score_id: str, entity: str, record_id: str, what: str, value: Any, cutoff) -> Violation:
@@ -318,7 +238,7 @@ def ch_005(session: Session) -> RuleCheck:
     cutoff = s.data_cutoff_timestamp
     included = se.included.is_(True)
     violations: list[Violation] = []
-    for entity, (model, pk, times, joins) in _SOURCES.items():
+    for entity, (model, pk, times, joins) in SOURCE_TIMES.items():
         stmt = (
             sa.select(
                 se.score_id,
@@ -351,7 +271,7 @@ def ch_005(session: Session) -> RuleCheck:
                 continue
             for i, (what, _) in enumerate(times):
                 value = getattr(r, f"t{i}")
-                if value is not None and _after(value, r.data_cutoff_timestamp):
+                if value is not None and after_cutoff(value, r.data_cutoff_timestamp):
                     violations.append(
                         _leak(
                             r.score_id,
@@ -385,7 +305,7 @@ def ch_005(session: Session) -> RuleCheck:
         )
     unknown = (
         sa.select(se.score_id, se.source_entity_type, se.source_record_id)
-        .where(included, se.source_entity_type.not_in(list(_SOURCES)))
+        .where(included, se.source_entity_type.not_in(list(SOURCE_TIMES)))
         .order_by(se.score_id, se.source_record_id)
     )
     for r in session.execute(unknown):
@@ -395,18 +315,11 @@ def ch_005(session: Session) -> RuleCheck:
                 r.score_id,
                 "score_evidence.source_entity_type",
                 f"{r.source_entity_type}:{r.source_record_id}",
-                f"one of {sorted(_SOURCES)}",
+                f"one of {sorted(SOURCE_TIMES)}",
                 f"score {r.score_id} includes evidence of unknown type {r.source_entity_type}",
             )
         )
     return RuleCheck(count(session, se, included), violations)
-
-
-def _after(value: Any, cutoff) -> bool:
-    """value > cutoff with D5 day granularity for DATE values."""
-    if hasattr(value, "hour"):
-        return value > cutoff
-    return value > cutoff.date()
 
 
 @rule(
