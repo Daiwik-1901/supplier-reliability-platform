@@ -33,9 +33,11 @@ from supplier_reliability.models import (
     PurchaseOrder,
     RawIngestionRecord,
     RiskSignal,
+    ScoreEvidence,
     Shipment,
     Site,
     Supplier,
+    SupplierScore,
 )
 from supplier_reliability.services.anomalies import (
     GroundTruthCase,
@@ -43,6 +45,7 @@ from supplier_reliability.services.anomalies import (
     inject_anomalies,
     write_ground_truth,
 )
+from supplier_reliability.services.export import column_converter
 from supplier_reliability.services.generator.config import (
     GeneratorCapacityError,
     GeneratorConfig,
@@ -90,19 +93,28 @@ def profiles(gen_cfg) -> dict[str, str]:
 
 
 @pytest.fixture(scope="session")
-def scored_starter_db(app_config, gen_cfg, tmp_path_factory) -> Path:
-    """Starter dataset loaded and scored for every scorecard window (built once)."""
-    path = tmp_path_factory.mktemp("injection") / "scored.db"
+def loaded_starter_db(gen_cfg, tmp_path_factory) -> Path:
+    """Starter dataset loaded but NOT scored (built once)."""
+    path = tmp_path_factory.mktemp("injection-loaded") / "loaded.db"
     url = f"sqlite:///{path}"
     run_migrations(url)
     engine = make_engine(url)
-    factory = make_session_factory(engine)
-    with session_scope(factory) as s:
+    with session_scope(make_session_factory(engine)) as s:
         load_dataset(s, generate_dataset(gen_cfg))
+    engine.dispose()
+    return path
+
+
+@pytest.fixture(scope="session")
+def scored_starter_db(app_config, gen_cfg, loaded_starter_db, tmp_path_factory) -> Path:
+    """loaded_starter_db scored for every scorecard window (built once)."""
+    path = tmp_path_factory.mktemp("injection") / "scored.db"
+    shutil.copyfile(loaded_starter_db, path)
+    engine = make_engine(f"sqlite:///{path}")
     windows = scorecard_windows(
         gen_cfg.reference_start, gen_cfg.reference_end, app_config.scoring.window_months
     )
-    with factory() as s:
+    with make_session_factory(engine)() as s:
         ScoringService(s, app_config.scoring, lambda: NOW).score_history(windows)
     engine.dispose()
     return path
@@ -235,6 +247,15 @@ def test_injection_refuses_an_existing_batch(injected, gen_cfg, app_config):
         inject_anomalies(session, gen_cfg, RandomSource(gen_cfg.seed), scoring=app_config.scoring)
 
 
+def test_injection_requires_scored_db(loaded_starter_db, tmp_path, gen_cfg, app_config):
+    """C payloads are checked against canonical current scores: score before injecting."""
+    for s in _open(loaded_starter_db, tmp_path / "unscored.db"):
+        with pytest.raises(ValueError, match="score"):
+            inject_anomalies(s, gen_cfg, RandomSource(gen_cfg.seed), scoring=app_config.scoring)
+        s.rollback()
+        assert s.scalar(sa.select(sa.func.count()).select_from(RawIngestionRecord)) == 0
+
+
 def test_not_enough_candidates_raises_capacity_error(session, gen_cfg, app_config):
     preset = gen_cfg.anomaly_preset.model_copy(
         update={"negatives": gen_cfg.anomaly_preset.negatives | {"shipments": 10_000}}
@@ -259,28 +280,147 @@ def test_negative_payloads_pass_payload_validation(injected):
         assert findings == [], (r.raw_record_id, findings)
 
 
-def test_negatives_are_canonical_copies_and_positives_use_raw_ids(injected):
+ID_FIELD = {
+    "SHIPMENT": "shipment_id",
+    "DELIVERY_EVENT": "delivery_event_id",
+    "RISK_SIGNAL": "risk_signal_id",
+    "SUPPLIER_SCORE": "score_id",
+}
+PREFIX = {
+    "SHIPMENT": "SHP",
+    "DELIVERY_EVENT": "EVT",
+    "RISK_SIGNAL": "RSK",
+    "SUPPLIER_SCORE": "SCORE",
+}
+CANONICAL_MODEL = {
+    "SHIPMENT": Shipment,
+    "DELIVERY_EVENT": DeliveryEvent,
+    "RISK_SIGNAL": RiskSignal,
+    "SUPPLIER_SCORE": SupplierScore,
+}
+
+
+def _by_type(session: Session, entity_type: str) -> list[RawIngestionRecord]:
+    """Raw records of one entity type, sorted by their natural id."""
+    rows = [r for r in _raw(session).values() if r.source_entity_type == entity_type]
+    return sorted(rows, key=lambda r: r.source_record_id)
+
+
+def test_every_raw_record_gets_a_fresh_neutral_natural_id(injected):
+    """R38: positives and negatives alike get <PREFIX>-RAW-NNNNNN from one counter per prefix,
+    numbered in the shuffled (raw_record_id) order, and no natural id exists in canonical."""
+    session, _ = injected
+    for entity_type, prefix in PREFIX.items():
+        rows = _by_type(session, entity_type)
+        assert rows
+        assert [r.source_record_id for r in rows] == [
+            f"{prefix}-RAW-{n:06d}" for n in range(1, len(rows) + 1)
+        ]
+        for r in rows:
+            assert r.payload[ID_FIELD[entity_type]] == r.source_record_id
+            assert session.get(CANONICAL_MODEL[entity_type], r.source_record_id) is None
+        # numbered in raw_record_id order: the number encodes only the shuffled position
+        raw_order = sorted(rows, key=lambda r: r.raw_record_id)
+        assert raw_order == rows
+
+
+def test_positive_natural_ids_are_not_grouped_by_class(injected):
+    session, result = injected
+    for issue, entity_type in ENTITY_OF_CLASS.items():
+        rows = _by_type(session, entity_type)
+        positives = {c.entity_id for c in result.cases if c.issue_type == issue}
+        positions = [i for i, r in enumerate(rows) if r.raw_record_id in positives]
+        k = len(positions)
+        assert k == 5 and len(rows) > k
+        assert positions != list(range(k)), issue  # not the first k ids
+        assert positions != list(range(len(rows) - k, len(rows))), issue  # nor the last k
+        assert positions != list(range(positions[0], positions[0] + k)), issue  # nor any block
+
+
+def _canonical_payload(row: object) -> dict:
+    table = type(row).__table__
+    return {
+        c.name: None if getattr(row, c.name) is None else column_converter(c)(getattr(row, c.name))
+        for c in table.columns
+    }
+
+
+def _source_of(session: Session, r: RawIngestionRecord) -> object:
+    """The canonical row a raw copy was made from (found by content, not by id)."""
+    p = r.payload
+    if r.source_entity_type == "SHIPMENT":
+        stmt = sa.select(Shipment).where(
+            Shipment.dispatch_timestamp == _ts(p["dispatch_timestamp"]),
+            Shipment.created_at == _ts(p["created_at"]),
+            Shipment.expected_delivery_timestamp == _ts(p["expected_delivery_timestamp"]),
+        )
+    elif r.source_entity_type == "DELIVERY_EVENT":
+        stmt = sa.select(DeliveryEvent).where(
+            DeliveryEvent.shipment_id == p["shipment_id"],
+            DeliveryEvent.event_type == p["event_type"],
+        )
+    elif r.source_entity_type == "RISK_SIGNAL":
+        stmt = sa.select(RiskSignal).where(RiskSignal.evidence_reference == p["evidence_reference"])
+    else:
+        stmt = sa.select(SupplierScore).where(
+            SupplierScore.supplier_id == p["supplier_id"],
+            SupplierScore.evaluation_start == _ts(p["evaluation_start"]),
+            SupplierScore.data_cutoff_timestamp == _ts(p["data_cutoff_timestamp"]),
+            SupplierScore.is_current.is_(True),
+        )
+    return session.scalars(stmt).one()
+
+
+def test_negatives_equal_their_canonical_source_except_the_id(injected):
     session, result = injected
     positive_ids = {c.entity_id for c in result.cases}
-    id_field = {
-        "SHIPMENT": "shipment_id",
-        "DELIVERY_EVENT": "delivery_event_id",
-        "RISK_SIGNAL": "risk_signal_id",
-        "SUPPLIER_SCORE": "score_id",
-    }
-    model = {
-        "SHIPMENT": Shipment,
-        "DELIVERY_EVENT": DeliveryEvent,
-        "RISK_SIGNAL": RiskSignal,
-    }
+    seen: Counter[str] = Counter()
     for r in _raw(session).values():
-        assert r.source_record_id == r.payload[id_field[r.source_entity_type]]
         if r.raw_record_id in positive_ids:
-            assert "-RAW-" in r.source_record_id
-        else:
-            assert "-RAW-" not in r.source_record_id
-            if r.source_entity_type in model:
-                assert session.get(model[r.source_entity_type], r.source_record_id) is not None
+            continue
+        source = _source_of(session, r)
+        expected = _canonical_payload(source)
+        id_field = ID_FIELD[r.source_entity_type]
+        payload = dict(r.payload)
+        assert payload.pop(id_field) == r.source_record_id != expected.pop(id_field)
+        if r.source_entity_type == "SUPPLIER_SCORE":
+            refs = payload.pop("evidence_refs")
+            included = session.execute(
+                sa.select(ScoreEvidence.source_entity_type, ScoreEvidence.source_record_id).where(
+                    ScoreEvidence.score_id == source.score_id, ScoreEvidence.included.is_(True)
+                )
+            ).all()
+            assert {(x["source_entity_type"], x["source_record_id"]) for x in refs} == {
+                tuple(x) for x in included
+            }
+            expected = {k: v for k, v in expected.items() if k in payload}
+        assert payload == expected, r.raw_record_id
+        seen[r.source_entity_type] += 1
+    assert set(seen) == set(ID_FIELD)
+
+
+def _base_key(r: RawIngestionRecord) -> tuple:
+    """Identifies the canonical base record of a raw copy, for positives and negatives alike."""
+    p = r.payload
+    return {
+        "SHIPMENT": lambda: (p["dispatch_timestamp"], p["created_at"]),
+        "DELIVERY_EVENT": lambda: (p["shipment_id"],),
+        "RISK_SIGNAL": lambda: (p["evidence_reference"],),
+        "SUPPLIER_SCORE": lambda: (p["supplier_id"], p["data_cutoff_timestamp"]),
+    }[r.source_entity_type]()
+
+
+def test_positives_and_negatives_never_share_a_canonical_base(injected):
+    session, result = injected
+    positive_ids = {c.entity_id for c in result.cases}
+    for entity_type in ID_FIELD:
+        rows = _by_type(session, entity_type)
+        pos = [_base_key(r) for r in rows if r.raw_record_id in positive_ids]
+        neg = [_base_key(r) for r in rows if r.raw_record_id not in positive_ids]
+        assert len(set(pos)) == len(pos)  # positives use distinct bases
+        assert not set(pos) & set(neg), entity_type
+        if entity_type == "DELIVERY_EVENT":  # two events (DISPATCHED + ARRIVED) per pair
+            assert all(n == 2 for n in Counter(neg).values())
 
 
 def test_positives_are_well_formed_except_missing_provenance(injected):
@@ -335,6 +475,7 @@ def test_site_conflation_fks_individually_valid(injected, gen_cfg):
             site.effective_to is None or dispatch <= site.effective_to
         )
         if site.supplier_id != po.supplier_id:
+            assert effective  # the site is valid on its own: attribution is the only defect
             cross += 1
         else:
             assert not effective
@@ -390,7 +531,7 @@ _TIMES = {  # entity -> (model, id column, occurrence column, recording column)
         RiskSignal.observed_timestamp,
         RiskSignal.recorded_timestamp,
     ),
-    "po_line": (POLine, POLine.po_line_id, POLine.created_at, POLine.created_at),
+    "po_line": (POLine, POLine.po_line_id, PurchaseOrder.order_date, POLine.created_at),
 }
 
 
@@ -407,7 +548,10 @@ def _post_cutoff_refs(session: Session, refs: list[dict], cutoff: datetime) -> l
         if entity not in _TIMES:
             continue
         _, id_col, occurred, recorded = _TIMES[entity]
-        row = session.execute(sa.select(occurred, recorded).where(id_col == record_id)).one()
+        stmt = sa.select(occurred, recorded).where(id_col == record_id)
+        if entity == "po_line":  # occurrence = the PO's order_date (as evidence.py)
+            stmt = stmt.join(PurchaseOrder, PurchaseOrder.po_id == POLine.po_id)
+        row = session.execute(stmt).one()
         if _after(row[0], cutoff) or _after(row[1], cutoff):
             late.append(record_id)
     return late
