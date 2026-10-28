@@ -52,7 +52,7 @@ recording time is <= C. Interpretations fixed here (documented, tested):
 """
 
 from collections import defaultdict
-from collections.abc import Sequence
+from collections.abc import Collection, Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal
@@ -211,6 +211,20 @@ class EvidenceBundle:
     open_critical_exception_ids: list[str] = field(default_factory=list)
 
 
+# Entity types `only_record_ids` may restrict (the source_entity_type names used in lineage).
+RESTRICTABLE_ENTITIES = frozenset(
+    {
+        "shipment",
+        "inspection",
+        "invoice",
+        "po_line",
+        "capacity_declaration",
+        "compliance_requirement",
+        "supplier_certification",
+        "risk_signal",
+    }
+)
+
 # --- collection -----------------------------------------------------------------------------
 
 _C = ComponentName
@@ -223,26 +237,42 @@ def collect_evidence(
     window: EvaluationWindow,
     *,
     lookback_days: int,
+    only_record_ids: Mapping[str, Collection[str]] | None = None,
 ) -> dict[str, EvidenceBundle]:
     """Eligible evidence per supplier at `window.cutoff` (see module docstring).
 
     `supplier_ids=None` means every supplier. Unknown ids raise ValueError. Every requested
     supplier gets a bundle, possibly empty. `lookback_days` is `scoring.lookback_days`.
     Runs a fixed number of set-based statements regardless of the number of suppliers.
+
+    `only_record_ids` (entity type -> record ids, keys from RESTRICTABLE_ENTITIES) restricts
+    the source records loaded to exactly those ids (a missing key means none of that entity);
+    every derivation (eligibility, arrival as of C, latest inspection, scope rule, current
+    certification, site/resolution state) then runs unchanged over that subset. Delivery
+    events are loaded for the restricted shipments. Used by `rebuild_from_lineage`.
     """
     ids = None if supplier_ids is None else sorted(set(supplier_ids))
     known = q.existing_supplier_ids(session, ids)
     if ids is not None and len(known) != len(ids):
         raise ValueError(f"unknown supplier ids: {sorted(set(ids) - set(known))}")
     acc: dict[str, _Lists] = {sid: defaultdict(list) for sid in known}
+    if only_record_ids is not None and set(only_record_ids) - RESTRICTABLE_ENTITIES:
+        raise ValueError(
+            f"cannot restrict entity types {sorted(set(only_record_ids) - RESTRICTABLE_ENTITIES)}"
+        )
 
-    _deliveries(session, ids, window, acc)
-    _inspections(session, ids, window, acc)
-    _invoices(session, ids, window, acc)
-    _demand(session, ids, window, acc)
-    _capacities(session, ids, window, acc)
-    _compliance(session, ids, window, acc)
-    _risks(session, ids, window, lookback_days, acc)
+    def only(entity: str) -> Collection[str] | None:
+        return None if only_record_ids is None else only_record_ids.get(entity, ())
+
+    _deliveries(session, ids, window, acc, only("shipment"))
+    _inspections(session, ids, window, acc, only("inspection"))
+    _invoices(session, ids, window, acc, only("invoice"))
+    _demand(session, ids, window, acc, only("po_line"))
+    _capacities(session, ids, window, acc, only("capacity_declaration"))
+    _compliance(
+        session, ids, window, acc, only("compliance_requirement"), only("supplier_certification")
+    )
+    _risks(session, ids, window, lookback_days, acc, only("risk_signal"))
     for row in q.open_critical_exceptions(session, ids):
         acc[row.supplier_id]["open_critical_exception_ids"].append(row.exception_id)
 
@@ -288,10 +318,12 @@ def _exclude(
     acc["excluded"].append(ExcludedRecord(entity, record_id, component, reason, month))
 
 
-def _deliveries(session: Session, ids, w: EvaluationWindow, acc: dict[str, _Lists]) -> None:
+def _deliveries(
+    session: Session, ids, w: EvaluationWindow, acc: dict[str, _Lists], only: q.Only
+) -> None:
     c, top = w.cutoff, w.occurrence_end
     due: dict[str, tuple[str, datetime]] = {}  # shipment_id -> (supplier_id, expected)
-    for r in q.shipments(session, ids, w.start, w.end):
+    for r in q.shipments(session, ids, w.start, w.end, only=only):
         reason = None
         if r.created_at > c:
             reason = "shipment_recorded_after_cutoff"
@@ -305,7 +337,7 @@ def _deliveries(session: Session, ids, w: EvaluationWindow, acc: dict[str, _List
             due[r.shipment_id] = (r.supplier_id, r.expected_delivery_timestamp)
 
     events: dict[str, list[Any]] = defaultdict(list)
-    for e in q.arrival_events(session, ids, w.start, top):
+    for e in q.arrival_events(session, ids, w.start, top, only=only):
         if e.shipment_id not in due:
             continue  # cancelled or not known at C
         if e.recorded_timestamp <= c:
@@ -363,10 +395,12 @@ def _known_arrival(events: list[Any], cutoff: datetime) -> tuple[datetime | None
     return (when if when <= cutoff else None), unparseable
 
 
-def _inspections(session: Session, ids, w: EvaluationWindow, acc: dict[str, _Lists]) -> None:
+def _inspections(
+    session: Session, ids, w: EvaluationWindow, acc: dict[str, _Lists], only: q.Only
+) -> None:
     latest: dict[str, Any] = {}  # shipment_line_id -> row
     for r in sorted(
-        q.inspections(session, ids, w.start, w.occurrence_end),
+        q.inspections(session, ids, w.start, w.occurrence_end, only=only),
         key=lambda r: (r.inspection_timestamp, r.inspection_id),
     ):
         if r.recorded_at > w.cutoff:
@@ -386,8 +420,10 @@ def _inspections(session: Session, ids, w: EvaluationWindow, acc: dict[str, _Lis
         )
 
 
-def _invoices(session: Session, ids, w: EvaluationWindow, acc: dict[str, _Lists]) -> None:
-    for r in q.invoices(session, ids, w.start.date(), w.occurrence_end.date()):
+def _invoices(
+    session: Session, ids, w: EvaluationWindow, acc: dict[str, _Lists], only: q.Only
+) -> None:
+    for r in q.invoices(session, ids, w.start.date(), w.occurrence_end.date(), only=only):
         if r.recorded_at > w.cutoff:
             _exclude(acc[r.supplier_id], "invoice", r.invoice_id, _C.cost,
                      "invoice_recorded_after_cutoff")  # fmt: skip
@@ -397,8 +433,11 @@ def _invoices(session: Session, ids, w: EvaluationWindow, acc: dict[str, _Lists]
             )
 
 
-def _demand(session: Session, ids, w: EvaluationWindow, acc: dict[str, _Lists]) -> None:
-    for r in q.demand_lines(session, ids, w.start.date(), w.occurrence_end.date(), w.cutoff):
+def _demand(
+    session: Session, ids, w: EvaluationWindow, acc: dict[str, _Lists], only: q.Only
+) -> None:
+    first, last = w.start.date(), w.occurrence_end.date()
+    for r in q.demand_lines(session, ids, first, last, w.cutoff, only=only):
         acc[r.supplier_id]["demand"].append(
             DemandObs(
                 r.po_line_id, r.order_date.replace(day=1), r.ordered_quantity, r.unit_of_measure
@@ -415,14 +454,16 @@ def _months(first: date, last: date) -> list[date]:
     return out
 
 
-def _capacities(session: Session, ids, w: EvaluationWindow, acc: dict[str, _Lists]) -> None:
+def _capacities(
+    session: Session, ids, w: EvaluationWindow, acc: dict[str, _Lists], only: q.Only
+) -> None:
     first, last = w.start.date().replace(day=1), w.occurrence_end.date()
     window_months = _months(first, last)
     # (supplier, month) -> {"site": [obs], "wide": [obs]}
     cells: dict[tuple[str, date], dict[str, list[CapacityObs]]] = defaultdict(
         lambda: {"site": [], "wide": []}
     )
-    for r in q.capacity_declarations(session, ids, first, last):
+    for r in q.capacity_declarations(session, ids, first, last, only=only):
         if r.recorded_at > w.cutoff:
             _exclude(acc[r.supplier_id], "capacity_declaration", r.capacity_declaration_id,
                      _C.capacity, "capacity_recorded_after_cutoff")  # fmt: skip
@@ -464,8 +505,15 @@ def _compliance_state(cert: Any, day: date) -> ComplianceState:
     return ComplianceState.UNKNOWN  # not yet valid at C
 
 
-def _compliance(session: Session, ids, w: EvaluationWindow, acc: dict[str, _Lists]) -> None:
-    rows = q.certifications(session, ids, w.cutoff)  # all recorded <= C
+def _compliance(
+    session: Session,
+    ids,
+    w: EvaluationWindow,
+    acc: dict[str, _Lists],
+    only_requirements: q.Only,
+    only_certifications: q.Only,
+) -> None:
+    rows = q.certifications(session, ids, w.cutoff, only=only_certifications)  # recorded <= C
     superseded = {r.supersedes_certification_id for r in rows if r.supersedes_certification_id}
     current: dict[tuple[str, str, str | None], Any] = {}
     for r in sorted(rows, key=lambda r: (r.recorded_at, r.certification_id)):
@@ -480,7 +528,7 @@ def _compliance(session: Session, ids, w: EvaluationWindow, acc: dict[str, _List
                      "certification_superseded")  # fmt: skip
         current[key] = r
     day = w.cutoff.date()
-    for req in q.requirements(session, ids, w.cutoff):
+    for req in q.requirements(session, ids, w.cutoff, only=only_requirements):
         site = req.site_id if req.scope == RequirementScope.SITE else None
         cert = current.get((req.supplier_id, req.certification_type, site))
         acc[req.supplier_id]["compliance"].append(
@@ -509,11 +557,16 @@ def _site_active(r: Any, day: date) -> bool:
 
 
 def _risks(
-    session: Session, ids, w: EvaluationWindow, lookback_days: int, acc: dict[str, _Lists]
+    session: Session,
+    ids,
+    w: EvaluationWindow,
+    lookback_days: int,
+    acc: dict[str, _Lists],
+    only: q.Only,
 ) -> None:
     c = w.cutoff
     horizon = c - timedelta(days=lookback_days)
-    for r in q.risk_signals(session, ids, min(w.start, horizon), c):
+    for r in q.risk_signals(session, ids, min(w.start, horizon), c, only=only):
         sup = acc[r.supplier_id]
         if r.observed_timestamp < horizon:
             if r.observed_timestamp >= w.start:

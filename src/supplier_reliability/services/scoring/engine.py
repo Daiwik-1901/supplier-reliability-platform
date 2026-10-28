@@ -240,82 +240,78 @@ def _excluded(
 # --- fingerprint -----------------------------------------------------------------------------
 
 
-def _observations(bundle: EvidenceBundle, results: dict[str, ComponentResult]) -> list[dict]:
-    """Exactly the lineage set (R24): one item per record in a component's `source_record_ids`,
-    with the values the component used. Nothing is added beyond the components' included ids."""
+def evidence_observations(bundle: EvidenceBundle) -> list[dict[str, Any]]:
+    """Every observation in the bundle as a JSON-ready {component, record_id, <values the
+    component uses>} dict, in bundle order. A capacity declaration yields one item per covered
+    month. Used for the fingerprint (filtered to the lineage set) and for score_evidence
+    `contribution` values (Task 12)."""
     obs: list[dict[str, Any]] = []
 
     def add(component: ComponentName, record_id: str, **values: Any) -> None:
         obs.append(_plain({"component": component.value, "record_id": record_id, **values}))
 
-    def included(name: ComponentName) -> set[str]:
-        return set(results[name.value].source_record_ids)
-
-    ids = included(ComponentName.delivery)
     for d in bundle.deliveries:
-        if d.shipment_id in ids:
-            add(ComponentName.delivery, d.shipment_id, expected=d.expected, arrived=d.arrived_known)
-    ids = included(ComponentName.quality)
+        add(ComponentName.delivery, d.shipment_id, expected=d.expected, arrived=d.arrived_known)
     for i in bundle.inspections:
-        if i.inspection_id in ids:
-            add(
-                ComponentName.quality,
-                i.inspection_id,
-                shipment_line_id=i.shipment_line_id,
-                inspected=i.inspected,
-                defect=i.defect,
-            )
-    ids = included(ComponentName.cost)
+        add(
+            ComponentName.quality,
+            i.inspection_id,
+            shipment_line_id=i.shipment_line_id,
+            inspected=i.inspected,
+            defect=i.defect,
+        )
     for inv in bundle.invoices:
-        if inv.invoice_id in ids:
-            add(ComponentName.cost, inv.invoice_id, expected=inv.expected, invoiced=inv.invoiced)
-    ids = included(ComponentName.capacity)
+        add(ComponentName.cost, inv.invoice_id, expected=inv.expected, invoiced=inv.invoiced)
     for line in bundle.demand:
-        if line.po_line_id in ids:
-            add(
-                ComponentName.capacity,
-                line.po_line_id,
-                kind="demand",
-                month=line.month,
-                quantity=line.quantity,
-                unit_of_measure=line.unit_of_measure,
-            )
+        add(
+            ComponentName.capacity,
+            line.po_line_id,
+            kind="demand",
+            month=line.month,
+            quantity=line.quantity,
+            unit_of_measure=line.unit_of_measure,
+        )
     for c in bundle.capacities:
-        if c.capacity_declaration_id in ids:
-            add(
-                ComponentName.capacity,
-                c.capacity_declaration_id,
-                kind="declaration",
-                site_id=c.site_id,
-                month=c.month,
-                available=c.available,
-                committed=c.committed,
-                verified=c.verified,
-            )
-    ids = included(ComponentName.compliance)
+        add(
+            ComponentName.capacity,
+            c.capacity_declaration_id,
+            kind="declaration",
+            site_id=c.site_id,
+            month=c.month,
+            available=c.available,
+            committed=c.committed,
+            verified=c.verified,
+        )
     for r in bundle.compliance:
-        if r.requirement_id in ids:
-            add(
-                ComponentName.compliance,
-                r.requirement_id,
-                certification_id=r.certification_id,
-                state=r.state,
-                mandatory=r.mandatory,
-                valid_from=r.valid_from,
-                valid_to=r.valid_to,
-            )
-    ids = included(ComponentName.disruption)
+        add(
+            ComponentName.compliance,
+            r.requirement_id,
+            certification_id=r.certification_id,
+            state=r.state,
+            mandatory=r.mandatory,
+            valid_from=r.valid_from,
+            valid_to=r.valid_to,
+        )
     for s in bundle.risks:
-        if s.risk_signal_id in ids:
-            add(
-                ComponentName.disruption,
-                s.risk_signal_id,
-                signal_type=s.signal_type,
-                severity=s.severity,
-                observed=s.observed,
-                site_active=s.site_active,
-                resolved_at_cutoff=s.resolved_at_cutoff,
-            )
+        add(
+            ComponentName.disruption,
+            s.risk_signal_id,
+            signal_type=s.signal_type,
+            severity=s.severity,
+            observed=s.observed,
+            site_active=s.site_active,
+            resolved_at_cutoff=s.resolved_at_cutoff,
+        )
+    return obs
+
+
+def _observations(bundle: EvidenceBundle, results: dict[str, ComponentResult]) -> list[dict]:
+    """Exactly the lineage set (R24): one item per record in a component's `source_record_ids`,
+    with the values the component used. Nothing is added beyond the components' included ids."""
+    included = {
+        (name, record_id) for name, r in results.items() for record_id in r.source_record_ids
+    }
+    obs = [o for o in evidence_observations(bundle) if (o["component"], o["record_id"]) in included]
     return sorted(obs, key=lambda o: (o["component"], o["record_id"], _canonical(o)))
 
 

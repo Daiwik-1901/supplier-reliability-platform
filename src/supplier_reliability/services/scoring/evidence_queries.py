@@ -3,10 +3,12 @@ suppliers; no per-supplier queries. Time windows are applied in SQL; the recorde
 split happens in Python (evidence.py) because those rows are reported as excluded evidence.
 
 Every function takes `ids` (the supplier ids to restrict to, or None for every supplier) and
-returns plain `Row`s. Money and quantities come back as Decimal (SQLAlchemy Numeric).
+returns plain `Row`s. Money and quantities come back as Decimal (SQLAlchemy Numeric). The
+keyword `only` (record ids, or None for no restriction) limits a query to the named records of
+its own entity; `rebuild_from_lineage` (Task 12) uses it to load exactly a score's lineage.
 """
 
-from collections.abc import Sequence
+from collections.abc import Collection, Sequence
 from datetime import date, datetime
 
 import sqlalchemy as sa
@@ -40,10 +42,11 @@ from supplier_reliability.models import (
 )
 
 Ids = Sequence[str] | None
+Only = Collection[str] | None
 
 
-def _of(column: sa.ColumnElement, ids: Ids) -> sa.ColumnElement[bool]:
-    return sa.true() if ids is None else column.in_(list(ids))
+def _of(column: sa.ColumnElement, ids: Ids | Only) -> sa.ColumnElement[bool]:
+    return sa.true() if ids is None else column.in_(sorted(ids))
 
 
 def _effective_at(model, day: date) -> sa.ColumnElement[bool]:
@@ -59,7 +62,9 @@ def existing_supplier_ids(session: Session, ids: Ids) -> list[str]:
     return list(session.scalars(stmt.order_by(Supplier.supplier_id)))
 
 
-def shipments(session: Session, ids: Ids, start: datetime, end: datetime) -> Sequence[Row]:
+def shipments(
+    session: Session, ids: Ids, start: datetime, end: datetime, *, only: Only = None
+) -> Sequence[Row]:
     """Shipments with expected delivery in [start, end] (due and not-yet-due alike, any
     created_at: rows created after the cutoff are reported as excluded)."""
     stmt = (
@@ -74,13 +79,17 @@ def shipments(session: Session, ids: Ids, start: datetime, end: datetime) -> Seq
         .where(
             _of(PurchaseOrder.supplier_id, ids),
             Shipment.expected_delivery_timestamp.between(start, end),
+            _of(Shipment.shipment_id, only),
         )
     )
     return session.execute(stmt).all()
 
 
-def arrival_events(session: Session, ids: Ids, start: datetime, end: datetime) -> Sequence[Row]:
-    """ARRIVED and CORRECTION events of shipments with expected delivery in [start, end]."""
+def arrival_events(
+    session: Session, ids: Ids, start: datetime, end: datetime, *, only: Only = None
+) -> Sequence[Row]:
+    """ARRIVED and CORRECTION events of shipments with expected delivery in [start, end]
+    (`only`: shipment ids)."""
     stmt = (
         sa.select(
             DeliveryEvent.delivery_event_id,
@@ -96,12 +105,15 @@ def arrival_events(session: Session, ids: Ids, start: datetime, end: datetime) -
             _of(PurchaseOrder.supplier_id, ids),
             Shipment.expected_delivery_timestamp.between(start, end),
             DeliveryEvent.event_type.in_([DeliveryEventType.ARRIVED, DeliveryEventType.CORRECTION]),
+            _of(Shipment.shipment_id, only),
         )
     )
     return session.execute(stmt).all()
 
 
-def inspections(session: Session, ids: Ids, start: datetime, end: datetime) -> Sequence[Row]:
+def inspections(
+    session: Session, ids: Ids, start: datetime, end: datetime, *, only: Only = None
+) -> Sequence[Row]:
     """Inspections with inspection_timestamp in [start, end]; supplier via allocation ->
     shipment -> PO (D1/D2)."""
     stmt = (
@@ -123,12 +135,15 @@ def inspections(session: Session, ids: Ids, start: datetime, end: datetime) -> S
         .where(
             _of(PurchaseOrder.supplier_id, ids),
             Inspection.inspection_timestamp.between(start, end),
+            _of(Inspection.inspection_id, only),
         )
     )
     return session.execute(stmt).all()
 
 
-def invoices(session: Session, ids: Ids, first: date, last: date) -> Sequence[Row]:
+def invoices(
+    session: Session, ids: Ids, first: date, last: date, *, only: Only = None
+) -> Sequence[Row]:
     """Invoices with invoice_date in [first, last]."""
     stmt = sa.select(
         Invoice.invoice_id,
@@ -136,12 +151,22 @@ def invoices(session: Session, ids: Ids, first: date, last: date) -> Sequence[Ro
         Invoice.expected_amount,
         Invoice.invoiced_amount,
         Invoice.recorded_at,
-    ).where(_of(Invoice.supplier_id, ids), Invoice.invoice_date.between(first, last))
+    ).where(
+        _of(Invoice.supplier_id, ids),
+        Invoice.invoice_date.between(first, last),
+        _of(Invoice.invoice_id, only),
+    )
     return session.execute(stmt).all()
 
 
 def demand_lines(
-    session: Session, ids: Ids, first: date, last: date, cutoff: datetime
+    session: Session,
+    ids: Ids,
+    first: date,
+    last: date,
+    cutoff: datetime,
+    *,
+    only: Only = None,
 ) -> Sequence[Row]:
     """PO lines of non-CANCELLED POs ordered in [first, last], PO and line created <= cutoff."""
     stmt = (
@@ -159,12 +184,15 @@ def demand_lines(
             PurchaseOrder.order_date.between(first, last),
             PurchaseOrder.created_at <= cutoff,
             POLine.created_at <= cutoff,
+            _of(POLine.po_line_id, only),
         )
     )
     return session.execute(stmt).all()
 
 
-def capacity_declarations(session: Session, ids: Ids, first: date, last: date) -> Sequence[Row]:
+def capacity_declarations(
+    session: Session, ids: Ids, first: date, last: date, *, only: Only = None
+) -> Sequence[Row]:
     """Declarations whose period overlaps [first, last]."""
     cd = CapacityDeclaration
     stmt = sa.select(
@@ -177,11 +205,18 @@ def capacity_declarations(session: Session, ids: Ids, first: date, last: date) -
         cd.committed_capacity,
         cd.verification_status,
         cd.recorded_at,
-    ).where(_of(cd.supplier_id, ids), cd.period_start <= last, cd.period_end >= first)
+    ).where(
+        _of(cd.supplier_id, ids),
+        cd.period_start <= last,
+        cd.period_end >= first,
+        _of(cd.capacity_declaration_id, only),
+    )
     return session.execute(stmt).all()
 
 
-def requirements(session: Session, ids: Ids, cutoff: datetime) -> Sequence[Row]:
+def requirements(
+    session: Session, ids: Ids, cutoff: datetime, *, only: Only = None
+) -> Sequence[Row]:
     """Requirements effective at the cutoff date, created <= cutoff, on (non-DRAFT) contracts
     whose effective period contains the cutoff date (D11)."""
     day = cutoff.date()
@@ -202,12 +237,15 @@ def requirements(session: Session, ids: Ids, cutoff: datetime) -> Sequence[Row]:
             req.created_at <= cutoff,
             _effective_at(Contract, day),
             Contract.contract_status != ContractStatus.DRAFT,
+            _of(req.requirement_id, only),
         )
     )
     return session.execute(stmt).all()
 
 
-def certifications(session: Session, ids: Ids, cutoff: datetime) -> Sequence[Row]:
+def certifications(
+    session: Session, ids: Ids, cutoff: datetime, *, only: Only = None
+) -> Sequence[Row]:
     """Every certification row recorded <= cutoff (supersession is resolved in Python)."""
     sc = SupplierCertification
     stmt = sa.select(
@@ -221,11 +259,13 @@ def certifications(session: Session, ids: Ids, cutoff: datetime) -> Sequence[Row
         sc.valid_to,
         sc.supersedes_certification_id,
         sc.recorded_at,
-    ).where(_of(sc.supplier_id, ids), sc.recorded_at <= cutoff)
+    ).where(_of(sc.supplier_id, ids), sc.recorded_at <= cutoff, _of(sc.certification_id, only))
     return session.execute(stmt).all()
 
 
-def risk_signals(session: Session, ids: Ids, start: datetime, cutoff: datetime) -> Sequence[Row]:
+def risk_signals(
+    session: Session, ids: Ids, start: datetime, cutoff: datetime, *, only: Only = None
+) -> Sequence[Row]:
     """Signals observed in [start, cutoff], with their site's status/effective dates."""
     rs = RiskSignal
     stmt = (
@@ -245,7 +285,11 @@ def risk_signals(session: Session, ids: Ids, start: datetime, cutoff: datetime) 
             Site.effective_to.label("site_effective_to"),
         )
         .outerjoin(Site, Site.site_id == rs.site_id)
-        .where(_of(rs.supplier_id, ids), rs.observed_timestamp.between(start, cutoff))
+        .where(
+            _of(rs.supplier_id, ids),
+            rs.observed_timestamp.between(start, cutoff),
+            _of(rs.risk_signal_id, only),
+        )
     )
     return session.execute(stmt).all()
 
