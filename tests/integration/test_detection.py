@@ -11,7 +11,6 @@ import random
 import shutil
 from collections import Counter
 from collections.abc import Iterator
-from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
@@ -46,9 +45,8 @@ from supplier_reliability.repositories.exceptions import (
     get_exception,
     list_exceptions,
 )
-from supplier_reliability.services.anomalies import GroundTruthCase, inject_anomalies
+from supplier_reliability.services.anomalies import GroundTruthCase
 from supplier_reliability.services.anomaly_detection import DetectionResult, detect_raw_batch
-from supplier_reliability.services.generator.rng import RandomSource
 from supplier_reliability.services.isolation import find_ground_truth_references
 from supplier_reliability.services.scoring.engine import score_supplier
 from supplier_reliability.services.scoring.evidence import (
@@ -89,27 +87,6 @@ ID_FIELD = {
 
 
 # --- fixtures ---------------------------------------------------------------------------------
-
-
-@dataclass(frozen=True)
-class Injected:
-    path: Path
-    batch_id: str
-    cases: list[GroundTruthCase]
-
-
-@pytest.fixture(scope="session")
-def injected_db(scored_starter_db, gen_cfg, app_config, tmp_path_factory) -> Injected:
-    path = tmp_path_factory.mktemp("detection") / "injected.db"
-    shutil.copyfile(scored_starter_db, path)
-    engine = make_engine(f"sqlite:///{path}")
-    with make_session_factory(engine)() as s:
-        result = inject_anomalies(
-            s, gen_cfg, RandomSource(gen_cfg.seed), scoring=app_config.scoring
-        )
-        s.commit()
-    engine.dispose()
-    return Injected(path, result.batch_id, result.cases)
 
 
 def _open(src: Path, target: Path) -> Iterator[Session]:
