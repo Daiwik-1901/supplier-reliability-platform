@@ -24,7 +24,13 @@ from supplier_reliability.services.generator.master_data import generate_master_
 from supplier_reliability.services.generator.quality_finance import (
     generate_inspections_and_invoices,
 )
-from supplier_reliability.services.generator.risk import generate_risk_signals, risk_dedup_key
+from supplier_reliability.services.generator.risk import (
+    RISK_SOURCES,
+    duplicate_source_pool,
+    generate_risk_signals,
+    plan_risk_signals,
+    risk_dedup_key,
+)
 from supplier_reliability.services.generator.rng import RandomSource
 from supplier_reliability.services.generator.transactions import generate_orders_and_shipments
 
@@ -385,23 +391,59 @@ def test_monitoring_attestations_quarterly_for_about_70_percent(starter):
     assert all(r["severity"] != Severity.NONE for r in others)
 
 
-def test_duplicate_signals_share_dedup_key_with_other_source(starter):
-    _, ds = starter
-    risks = [
-        r for r in ds.risk_signals if r["signal_type"] != RiskSignalType.MONITORING_ATTESTATION
+def _strip(row):
+    return {k: v for k, v in row.items() if k not in ("risk_signal_id", "evidence_reference")}
+
+
+def _key(row):
+    return tuple(sorted(_strip(row).items()))
+
+
+@pytest.mark.parametrize("seed", [20261022, 7, 424242])
+def test_duplicate_signals_pair_with_their_original(app_config, seed):
+    """Duplicates are identified by the generator's own plan, so coincidental collisions of
+    independent signals cannot break the assertions under any seed."""
+    cfg = GeneratorConfig.from_app_config(app_config, "starter", seed=seed)
+    rs, ids, ds = RandomSource(cfg.seed), IdRegistry(), GeneratedDataset(config=cfg)
+    generate_master_data(cfg, rs, ids, ds)
+    generate_orders_and_shipments(cfg, rs, ids, ds)
+    generate_inspections_and_invoices(cfg, rs, ids, ds)
+    plan = plan_risk_signals(cfg, rs, ds)
+
+    assert len(plan.duplicates) == round(0.05 * len(plan.originals))
+    assert len({i for i, _ in plan.duplicates}) == len(plan.duplicates)
+    for i, dup in plan.duplicates:
+        orig = plan.originals[i]
+        for k in ("supplier_id", "site_id", "signal_type", "related_shipment_id"):
+            assert dup[k] == orig[k], k
+        assert dup["related_contract_id"] == orig["related_contract_id"]
+        assert dup["dedup_key"] == orig["dedup_key"]
+        assert timedelta(0) <= dup["observed_timestamp"] - orig["observed_timestamp"]
+        assert dup["observed_timestamp"] - orig["observed_timestamp"] <= timedelta(days=2)
+        assert dup["signal_source"] != orig["signal_source"]
+        # Every type has >= 2 own sources, so the copy comes from the same type's sources.
+        assert dup["signal_source"] in RISK_SOURCES[orig["signal_type"]]
+        assert dup["signal_source"].startswith("SYNTHETIC_")
+
+    # The plan is exactly what generate_dataset loads (ids aside).
+    planned = [*plan.originals, *(d for _, d in plan.duplicates), *plan.attestations]
+    generated = generate_dataset(cfg).risk_signals
+    assert Counter(map(_key, generated)) == Counter(map(_key, planned))
+
+
+def test_duplicate_source_pool_prefers_same_type_then_falls_back():
+    t = RiskSignalType
+    assert duplicate_source_pool(t.CARRIER_DELAY, "SYNTHETIC_CARRIER_FEED") == [
+        "SYNTHETIC_LOGISTICS_MONITOR"
     ]
-    groups = defaultdict(list)
-    for r in risks:
-        groups[r["dedup_key"]].append(r)
-    dupes = [g for g in groups.values() if len(g) > 1]
-    n_dupes = sum(len(g) - 1 for g in dupes)
-    originals = len(risks) - n_dupes
-    assert n_dupes == round(0.05 * originals)
-    for g in dupes:
-        assert len({r["signal_source"] for r in g}) == len(g)
-        assert len({(r["supplier_id"], r["site_id"], r["signal_type"]) for r in g}) == 1
-        ts = sorted(r["observed_timestamp"] for r in g)
-        assert ts[-1] - ts[0] <= timedelta(days=2)
+    sources = {
+        t.CARRIER_DELAY: ("SYNTHETIC_A",),
+        t.FACTORY_INCIDENT: ("SYNTHETIC_C", "SYNTHETIC_B"),
+    }
+    assert duplicate_source_pool(t.CARRIER_DELAY, "SYNTHETIC_A", sources) == [
+        "SYNTHETIC_B",
+        "SYNTHETIC_C",
+    ]
 
 
 def test_risk_rate_tracks_profile(starter):

@@ -6,10 +6,14 @@ Byte-for-byte reproducible on every OS (ruling R3):
 - columns in model order; rows sorted by primary key in Python (so the order does not depend
   on the database collation);
 - NULL -> empty CSV cell / JSON ``null``; Decimal -> fixed-point string with the column's scale
-  (``"1234.50"``; SQLite hands Numeric back as float, so values are re-quantised via
-  ``Decimal(str(value))``, ROUND_HALF_UP); datetimes -> ``YYYY-MM-DDTHH:MM:SS.ffffffZ`` (UTC);
-  dates -> ``YYYY-MM-DD``; booleans -> ``true`` / ``false``; JSON columns -> canonical JSON
-  (sorted keys, separators ``(",", ":")``) as text in CSV and as a nested value in JSONL.
+  (``"1234.50"``, ``format_decimal``: ROUND_HALF_UP, no exponent, zero unsigned). Values must
+  already be quantised to the column scale at insert time (the generator does this). On SQLite,
+  Numeric is stored as a binary float and SQLAlchemy's result processor turns it back into
+  ``Decimal("%.<scale>f" % value)``, so read-back rounding happens there, not here;
+  ``format_decimal`` only fixes the scale, the sign of zero and the notation.
+  Datetimes -> ``YYYY-MM-DDTHH:MM:SS.ffffffZ`` (UTC); dates -> ``YYYY-MM-DD``; booleans ->
+  ``true`` / ``false``; JSON columns -> canonical JSON (sorted keys,
+  separators ``(",", ":")``) as text in CSV and as a nested value in JSONL.
 - JSONL lines keep model column order (they are not key-sorted) and use the same separators.
 
 The manifest's ``content_checksum`` is sha256 over the canonical JSON of the sorted
@@ -69,16 +73,22 @@ def canonical_json(value: Any) -> str:
     return json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
 
 
+def format_decimal(value: Decimal, scale: int) -> str:
+    """Fixed-point string with exactly ``scale`` decimals (ROUND_HALF_UP), never scientific
+    notation, and zero always unsigned (``-0.00`` -> ``0.00``) so every backend exports the
+    same bytes."""
+    q = Decimal(str(value)).quantize(Decimal(1).scaleb(-scale), rounding=ROUND_HALF_UP)
+    if q.is_zero():
+        q = q.copy_abs()
+    return format(q, "f")
+
+
 def _converter(column: sa.Column) -> Any:
     """Per-column function: DB value -> JSON-ready value (str / bool / int / dict / None)."""
     ctype = column.type
     if isinstance(ctype, sa.Numeric) and not isinstance(ctype, sa.Float):
-        step = Decimal(1).scaleb(-(ctype.scale or 0))
-
-        def number(v: Any) -> str:
-            return str(Decimal(str(v)).quantize(step, rounding=ROUND_HALF_UP))
-
-        return number
+        scale = ctype.scale or 0
+        return lambda v: format_decimal(v, scale)
     if isinstance(ctype, sa.JSON):
         return lambda v: json.loads(canonical_json(v))  # nested keys sorted
     return _scalar

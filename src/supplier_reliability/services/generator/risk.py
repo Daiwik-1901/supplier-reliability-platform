@@ -22,14 +22,16 @@ Decisions (documented assumptions):
   supplier-wide, RESOLVED with valid_to = quarter end: there is nothing to resolve, and the
   attestation covers that quarter).
 - Duplicates: round(5%) of the risk signals (not attestations) get one copy from a different
-  SYNTHETIC_ source: same supplier/site/type, observed 0-2 days later but inside the same D6
-  week bucket and period, so the copy shares the original's dedup_key. ~30% of copies carry
-  a re-drawn severity (sources disagree; scoring keeps the highest).
+  SYNTHETIC_ source of the same signal type (``duplicate_source_pool``; other types' sources
+  only if the type has no other one): same supplier/site/type, observed 0-2 days later but
+  inside the same D6 week bucket and period, so the copy shares the original's dedup_key.
+  ~30% of copies carry a re-drawn severity (sources disagree; scoring keeps the highest).
 - Every signal_source starts with "SYNTHETIC_" and evidence_reference is
   "synthetic://risk/<risk_signal_id>". Ids are assigned in (observed_timestamp, supplier_id,
   signal_type, signal_source) order.
 """
 
+from dataclasses import dataclass
 from datetime import UTC, date, datetime, timedelta
 from typing import Any
 
@@ -43,7 +45,14 @@ from supplier_reliability.services.generator.ids import IdRegistry
 from supplier_reliability.services.generator.profiles import exact_subset
 from supplier_reliability.services.generator.rng import RandomSource
 
-__all__ = ["generate_risk_signals", "risk_dedup_key"]
+__all__ = [
+    "RISK_SOURCES",
+    "RiskPlan",
+    "duplicate_source_pool",
+    "generate_risk_signals",
+    "plan_risk_signals",
+    "risk_dedup_key",
+]
 
 T = RiskSignalType
 _TYPES = (
@@ -56,7 +65,7 @@ _TYPES = (
 _TYPE_P = (0.25, 0.20, 0.15, 0.15, 0.25)
 _SEVERITIES = (Severity.LOW, Severity.MEDIUM, Severity.HIGH, Severity.CRITICAL)
 _SEVERITY_P = (0.40, 0.35, 0.18, 0.07)
-_SOURCES = {
+RISK_SOURCES: dict[RiskSignalType, tuple[str, ...]] = {
     T.LOGISTICS_DISRUPTION: ("SYNTHETIC_LOGISTICS_MONITOR", "SYNTHETIC_NEWS_FEED"),
     T.FACTORY_INCIDENT: ("SYNTHETIC_SITE_AUDIT", "SYNTHETIC_NEWS_FEED"),
     T.FINANCIAL_DISTRESS: ("SYNTHETIC_CREDIT_MONITOR", "SYNTHETIC_NEWS_FEED"),
@@ -106,9 +115,37 @@ def _effective(row: dict[str, Any], d: date) -> bool:
     return row["effective_from"] <= d and (row["effective_to"] is None or d <= row["effective_to"])
 
 
+@dataclass
+class RiskPlan:
+    """Unsorted, id-less signal rows. ``duplicates`` pairs each copy with the index of its
+    original in ``originals`` (the pairing never reaches the canonical rows)."""
+
+    originals: list[dict[str, Any]]
+    duplicates: list[tuple[int, dict[str, Any]]]
+    attestations: list[dict[str, Any]]
+
+
 def generate_risk_signals(
     cfg: GeneratorConfig, rs: RandomSource, ids: IdRegistry, ds: GeneratedDataset
 ) -> None:
+    plan = plan_risk_signals(cfg, rs, ds)
+    rows = [*plan.originals, *(d for _, d in plan.duplicates), *plan.attestations]
+    rows.sort(
+        key=lambda r: (
+            r["observed_timestamp"],
+            r["supplier_id"],
+            r["signal_type"],
+            r["signal_source"],
+        )
+    )
+    for r in rows:
+        r["risk_signal_id"] = ids.next("risk")
+        r["evidence_reference"] = f"synthetic://risk/{r['risk_signal_id']}"
+    ds.risk_signals.extend(rows)
+
+
+def plan_risk_signals(cfg: GeneratorConfig, rs: RandomSource, ds: GeneratedDataset) -> RiskPlan:
+    """Draw every risk signal (deterministic in the seed: uses only the risk_* streams)."""
     rng = rs.stream("risk_signals")
     ref_start, ref_end = cfg.reference_start, cfg.reference_end
     span_min = int((ref_end - ref_start).total_seconds() // 60)
@@ -144,7 +181,7 @@ def generate_risk_signals(
             elif stype in _CONTRACT_TYPES:
                 active = [c for c in contracts[sid] if _effective(c, d)]
                 contract_id = active[0]["contract_id"] if active else None
-            sources = _SOURCES[stype]
+            sources = RISK_SOURCES[stype]
             risks.append(
                 _signal(
                     rng,
@@ -159,20 +196,11 @@ def generate_risk_signals(
                     observed=observed,
                 )
             )
-    rows = risks + _duplicates(rs.stream("risk_duplicates"), cfg, risks)
-    rows += _attestations(rs.stream("risk_attestations"), cfg, ds)
-    rows.sort(
-        key=lambda r: (
-            r["observed_timestamp"],
-            r["supplier_id"],
-            r["signal_type"],
-            r["signal_source"],
-        )
+    return RiskPlan(
+        originals=risks,
+        duplicates=_duplicates(rs.stream("risk_duplicates"), cfg, risks),
+        attestations=_attestations(rs.stream("risk_attestations"), cfg, ds),
     )
-    for r in rows:
-        r["risk_signal_id"] = ids.next("risk")
-        r["evidence_reference"] = f"synthetic://risk/{r['risk_signal_id']}"
-    ds.risk_signals.extend(rows)
 
 
 def _signal(
@@ -224,7 +252,7 @@ def _signal(
 
 def _duplicates(
     rng: np.random.Generator, cfg: GeneratorConfig, risks: list[dict[str, Any]]
-) -> list[dict[str, Any]]:
+) -> list[tuple[int, dict[str, Any]]]:
     out = []
     for pos in exact_subset(rng, len(risks), round(_DUPLICATE_FRACTION * len(risks))):
         orig = risks[pos]
@@ -236,32 +264,37 @@ def _duplicates(
         limit = min(observed + timedelta(days=2), bucket_end, cfg.reference_end)
         room = max(0, int((limit - observed).total_seconds() // 60))
         dup_at = observed + _minutes(rng, 0, room)
-        others = [s for s in _all_sources(orig["signal_type"]) if s != orig["signal_source"]]
+        others = duplicate_source_pool(orig["signal_type"], orig["signal_source"])
         severity = orig["severity"]
         if float(rng.random()) < _DUPLICATE_RESEVERITY_P:
             severity = _SEVERITIES[int(rng.choice(len(_SEVERITIES), p=_SEVERITY_P))]
-        out.append(
-            _signal(
-                rng,
-                cfg,
-                supplier_id=orig["supplier_id"],
-                site_id=orig["site_id"],
-                shipment_id=orig["related_shipment_id"],
-                contract_id=orig["related_contract_id"],
-                stype=orig["signal_type"],
-                severity=severity,
-                source=others[int(rng.integers(len(others)))],
-                observed=dup_at,
-            )
+        dup = _signal(
+            rng,
+            cfg,
+            supplier_id=orig["supplier_id"],
+            site_id=orig["site_id"],
+            shipment_id=orig["related_shipment_id"],
+            contract_id=orig["related_contract_id"],
+            stype=orig["signal_type"],
+            severity=severity,
+            source=others[int(rng.integers(len(others)))],
+            observed=dup_at,
         )
+        out.append((pos, dup))
     return out
 
 
-def _all_sources(stype: RiskSignalType) -> list[str]:
-    """Every synthetic risk source, the type's own first (sorted for determinism)."""
-    own = list(_SOURCES[stype])
-    rest = sorted({s for v in _SOURCES.values() for s in v} - set(own))
-    return own + rest
+def duplicate_source_pool(
+    stype: RiskSignalType,
+    original_source: str,
+    sources: dict[RiskSignalType, tuple[str, ...]] = RISK_SOURCES,
+) -> list[str]:
+    """Sources a duplicate of ``stype`` may come from: the type's other sources; only when the
+    type has none, every other synthetic source (sorted). Never ``original_source``."""
+    own = [x for x in sources[stype] if x != original_source]
+    if own:
+        return own
+    return sorted({x for v in sources.values() for x in v} - {original_source})
 
 
 def _attestations(

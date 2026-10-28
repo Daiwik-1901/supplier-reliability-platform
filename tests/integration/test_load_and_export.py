@@ -5,7 +5,6 @@ import hashlib
 import io
 import json
 import re
-import time
 from pathlib import Path
 
 import pytest
@@ -96,14 +95,10 @@ def test_load_order_is_parent_first():
 
 def test_full_preset_loads_into_migrated_sqlite(app_config, migrated_engine):
     cfg = GeneratorConfig.from_app_config(app_config, "full")
-    t0 = time.perf_counter()
     ds = generate_dataset(cfg)
-    t1 = time.perf_counter()
     factory = make_session_factory(migrated_engine)
     with session_scope(factory) as s:
         counts = load_dataset(s, ds)
-    t2 = time.perf_counter()
-    print(f"full preset: generate {t1 - t0:.1f}s, load {t2 - t1:.1f}s")
     assert counts["suppliers"] == 1000
     assert counts["purchase_orders"] == 10000
     assert counts["shipments"] == 15000
@@ -169,21 +164,6 @@ def test_export_uses_lf_and_canonical_formats(loaded, tmp_path):
     assert entries["supplier_scores.csv"].rows == 0
 
 
-def test_export_requantises_sqlite_float_numeric(loaded, tmp_path):
-    factory, _ = loaded
-    with session_scope(factory) as s:
-        first = s.scalar(sa.text("SELECT min(po_line_id) FROM po_lines"))
-        s.execute(
-            sa.text("UPDATE po_lines SET agreed_unit_price = 0.1 + 0.2 WHERE po_line_id = :i"),
-            {"i": first},
-        )
-    with session_scope(factory) as s:
-        export_tables(s, tmp_path, ["po_lines"])
-    row = _read_csv(tmp_path / "po_lines.csv")[0]
-    assert row["po_line_id"] == first
-    assert row["agreed_unit_price"] == "0.30"
-
-
 def test_export_is_deterministic(loaded, tmp_path):
     factory, _ = loaded
     with session_scope(factory) as s:
@@ -191,6 +171,20 @@ def test_export_is_deterministic(loaded, tmp_path):
     with session_scope(factory) as s:
         b = export_tables(s, tmp_path / "b", ["suppliers", "risk_signals", "delivery_events"])
     assert a == b
+
+
+# Regression guard against accidental format changes. Update this literal DELIBERATELY (and
+# say why in the commit) whenever the generator or the export format changes.
+STARTER_CONTRACT_PRICES_CSV_SHA256 = (
+    "b799070711dacdfc5f276df5f7f4cc75695a44e5cb3488cd50bafc4506253c75"
+)
+
+
+def test_export_pins_starter_contract_prices_sha256(loaded, tmp_path):
+    factory, _ = loaded
+    with session_scope(factory) as s:
+        entries = export_tables(s, tmp_path, ["contract_prices"])
+    assert entries["contract_prices.csv"].sha256 == STARTER_CONTRACT_PRICES_CSV_SHA256
 
 
 # --- manifest -------------------------------------------------------------------------------
