@@ -47,8 +47,11 @@ __all__ = [
     "PROVENANCE",
     "FileEntry",
     "build_manifest",
+    "column_converter",
     "execution_metadata",
     "export_tables",
+    "format_decimal",
+    "write_csv",
 ]
 
 _NOT_EXPORTED = frozenset({"dataset_jobs", "validation_runs", "validation_findings"})
@@ -83,7 +86,7 @@ def format_decimal(value: Decimal, scale: int) -> str:
     return format(q, "f")
 
 
-def _converter(column: sa.Column) -> Any:
+def column_converter(column: sa.Column) -> Any:
     """Per-column function: DB value -> JSON-ready value (str / bool / int / dict / None)."""
     ctype = column.type
     if isinstance(ctype, sa.Numeric) and not isinstance(ctype, sa.Float):
@@ -132,7 +135,7 @@ def export_tables(
     for name in tables:
         table = Base.metadata.tables[name]
         columns = list(table.columns)
-        convert = [_converter(c) for c in columns]
+        convert = [column_converter(c) for c in columns]
         is_json = [isinstance(c.type, sa.JSON) for c in columns]
         pk = [columns.index(c) for c in table.primary_key.columns]
         raw = [tuple(r) for r in session.execute(sa.select(*columns))]
@@ -140,12 +143,8 @@ def export_tables(
         rows = [[None if v is None else f(v) for v, f in zip(r, convert, strict=True)] for r in raw]
         header = [c.name for c in columns]
 
-        csv_path = out_dir / f"{name}.csv"
-        with csv_path.open("w", encoding="utf-8", newline="") as fh:
-            writer = csv.writer(fh, lineterminator="\n")
-            writer.writerow(header)
-            for row in rows:
-                writer.writerow([_csv_cell(v, j) for v, j in zip(row, is_json, strict=True)])
+        csv_rows = [[_csv_cell(v, j) for v, j in zip(row, is_json, strict=True)] for row in rows]
+        csv_entry = write_csv(out_dir, f"{name}.csv", header, csv_rows)
         jsonl_path = out_dir / f"{name}.jsonl"
         with jsonl_path.open("w", encoding="utf-8", newline="") as fh:
             for row in rows:
@@ -155,10 +154,26 @@ def export_tables(
                     ensure_ascii=False,
                 )
                 fh.write(line + "\n")
-        for path in (csv_path, jsonl_path):
-            rel = path.relative_to(out_dir).as_posix()
-            entries[rel] = FileEntry(rel, len(rows), _sha256(path))
+        entries[csv_entry.path] = csv_entry
+        rel = jsonl_path.relative_to(out_dir).as_posix()
+        entries[rel] = FileEntry(rel, len(rows), _sha256(jsonl_path))
     return entries
+
+
+def write_csv(
+    out_dir: Path, rel_path: str, header: Sequence[str], rows: Sequence[Sequence[str]]
+) -> FileEntry:
+    """Write one CSV (UTF-8 without BOM, ``\\n`` line endings, csv-module quoting) of already
+    formatted cells, in the given row order; returns its FileEntry (path relative to out_dir)."""
+    out_dir = Path(out_dir)
+    path = out_dir / rel_path
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", encoding="utf-8", newline="") as fh:
+        writer = csv.writer(fh, lineterminator="\n")
+        writer.writerow(header)
+        writer.writerows(rows)
+    rel = path.relative_to(out_dir).as_posix()
+    return FileEntry(rel, len(rows), _sha256(path))
 
 
 def execution_metadata(generated_at: datetime | str, duration_seconds: float) -> dict[str, Any]:
