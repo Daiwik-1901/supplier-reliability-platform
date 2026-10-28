@@ -1,0 +1,176 @@
+# Hand-calculated benchmark expectations (Task 12b, Add-D). NEVER regenerate from the engine.
+#
+# Every value below was derived by hand from D6/D7 and config/default.yaml (scoring 1.0.0):
+#   weights delivery 0.30, quality 0.25, cost 0.15, capacity 0.10, compliance 0.10,
+#   disruption 0.10; grace 24 h; delay penalty 2/day capped at 20; defect_rate_zero_score 0.10;
+#   variance_zero_score 0.10; capacity 0.80->100, 1.00->70, 1.50->0; HIGH weight 30;
+#   recency 90 days; lookback 180 days; resolved multiplier 0.5.
+# Evidence per quarter (tests/scoring/benchmarks/scenarios.py): 20 due shipments, each with one
+# 100-unit line inspected once (2,000 inspected) and one invoice expected 1000.00 (sum 20,000);
+# capacity: VERIFIED free 2,000 units every month, demand = util x 2,000 every month;
+# requirements: ISO9001 and ISO14001, both mandatory; one MONITORING_ATTESTATION per quarter.
+# Overall = round2(sum w_k * round2(c_k)) (sum of weights = 1.00).
+#
+# exp() constants (computed with a Python REPL, math.exp; arithmetic, not the engine):
+#   exp(-45/90)  = exp(-0.5)      = 0.6065306597  -> 30 x = 18.1959198
+#   exp(-137/90) = exp(-1.52222)  = 0.2182264002  -> 30 x = 6.5467920, 15 x = 3.2733960
+# Signal ages (age = C - observed, observed at 23:59:59 so ages are whole days):
+#   observed 2025-08-16 -> Q3 C 2025-09-30: 15 + 30 = 45 d; Q4 C 2025-12-31: 45 + 31+30+31 = 137 d
+#   observed 2025-05-16 -> Q2 C 2025-06-30: 15 + 30 = 45 d; Q3 C: 45 + 31+31+30 = 137 d;
+#                          Q4 C: 137 + 92 = 229 d > 180 -> outside the lookback
+#   observed 2025-02-14 -> Q1 C 2025-03-31: 14 + 31 = 45 d
+
+scenarios:
+  stable:
+    - quarter: Q1
+      delivery: 91.00     # 100 x 19/20 - min(20, 2 x 2) = 95 - 4
+      quality: 95.00      # 10/2000 = 0.005; 100 x (1 - 0.005/0.10) = 100 x 0.95
+      cost: 100.00        # 20 x (1000.00 -> 1000.00): wavp = 0/20000 = 0
+      capacity: 100.00    # util 1200/2000 = 0.60 <= 0.80
+      compliance: 100.00  # ISO9001 COMPLIANT, ISO14001 COMPLIANT: (100 + 100)/2
+      disruption: 100.00  # attestation only: penalty 0
+      overall: 96.05      # 27.30 + 23.75 + 15.00 + 10.00 + 10.00 + 10.00
+      category: HIGH      # 85 <= 96.05 <= 100
+      decision: PREFERRED # no override; HIGH -> PREFERRED
+    - quarter: Q2
+      delivery: 91.00     # 95 - min(20, 2 x 2) = 91
+      quality: 95.00      # 100 x (1 - 0.005/0.10)
+      cost: 100.00        # wavp 0
+      capacity: 100.00    # util 0.60
+      compliance: 100.00  # (100 + 100)/2
+      disruption: 100.00  # attestations only
+      overall: 96.05      # 27.30 + 23.75 + 15.00 + 30.00
+      category: HIGH
+      decision: PREFERRED
+    - quarter: Q3
+      delivery: 91.00     # 95 - 4
+      quality: 95.00      # 100 x 0.95
+      cost: 100.00        # wavp 0
+      capacity: 100.00    # util 0.60
+      compliance: 100.00  # (100 + 100)/2
+      disruption: 100.00  # attestations only
+      overall: 96.05      # 27.30 + 23.75 + 15.00 + 30.00
+      category: HIGH
+      decision: PREFERRED
+    - quarter: Q4
+      delivery: 91.00     # 95 - 4
+      quality: 95.00      # 100 x 0.95
+      cost: 100.00        # wavp 0
+      capacity: 100.00    # util 0.60
+      compliance: 100.00  # (100 + 100)/2
+      disruption: 100.00  # attestations only
+      overall: 96.05      # 27.30 + 23.75 + 15.00 + 30.00
+      category: HIGH
+      decision: PREFERRED
+
+  deteriorating:
+    - quarter: Q1
+      delivery: 89.00     # 100 x 19/20 - min(20, 2 x 3) = 95 - 6
+      quality: 95.00      # 10/2000 = 0.005 -> 100 x (1 - 0.05)
+      cost: 100.00        # 0 % overbilling: wavp 0
+      capacity: 100.00    # util 1400/2000 = 0.70 <= 0.80
+      compliance: 100.00  # (100 + 100)/2
+      disruption: 100.00  # attestation only
+      overall: 95.45      # 26.70 + 23.75 + 15.00 + 10.00 + 10.00 + 10.00
+      category: HIGH
+      decision: PREFERRED
+    - quarter: Q2
+      delivery: 70.00     # 100 x 16/20 - min(20, 2 x 5) = 80 - 10
+      quality: 80.00      # 40/2000 = 0.02 -> 100 x (1 - 0.2)
+      cost: 80.00         # 20 x (1000 -> 1020): wavp 400/20000 = 0.02 -> 100 x (1 - 0.2)
+      capacity: 85.00     # util 1800/2000 = 0.90 -> 100 - 30 x (0.10/0.20) = 100 - 15
+      compliance: 100.00  # (100 + 100)/2
+      disruption: 100.00  # attestations only
+      overall: 81.50      # 21.00 + 20.00 + 12.00 + 8.50 + 10.00 + 10.00
+      category: ACCEPTABLE  # 70 <= 81.50 < 85
+      decision: APPROVED
+    - quarter: Q3
+      delivery: 49.00     # 100 x 13/20 - min(20, 2 x 8) = 65 - 16
+      quality: 60.00      # 80/2000 = 0.04 -> 100 x (1 - 0.4)
+      cost: 60.00         # 20 x (1000 -> 1040): wavp 800/20000 = 0.04 -> 100 x (1 - 0.4)
+      capacity: 56.00     # util 2200/2000 = 1.10 -> 70 - 70 x (0.10/0.50) = 70 - 14
+      compliance: 100.00  # (100 + 100)/2 (ISO9001 valid_to 2025-11-14 >= C 2025-09-30)
+      disruption: 81.80   # HIGH open, age 45 d: 100 - 30 x 0.6065307 = 100 - 18.1959 = 81.8041
+      overall: 62.48      # 14.70 + 15.00 + 9.00 + 5.60 + 10.00 + 8.18
+      category: AT_RISK   # 50 <= 62.48 < 70
+      decision: MONITOR
+    - quarter: Q4
+      delivery: 30.00     # 100 x 10/20 - min(20, 2 x 10) = 50 - 20
+      quality: 40.00      # 120/2000 = 0.06 -> 100 x (1 - 0.6)
+      cost: 40.00         # 20 x (1000 -> 1060): wavp 1200/20000 = 0.06 -> 100 x (1 - 0.6)
+      capacity: 28.00     # util 2600/2000 = 1.30 -> 70 - 70 x (0.30/0.50) = 70 - 42
+      compliance: 50.00   # ISO9001 EXPIRED (valid_to 2025-11-14 < C) 0, ISO14001 100: 100/2
+      disruption: 93.45   # same signal, age 137 d: 100 - 30 x 0.2182264 = 100 - 6.5468 = 93.4532
+      overall: 42.15      # 9.00 + 10.00 + 6.00 + 2.80 + 5.00 + 9.345 = 42.145 -> half up 42.15
+      category: CRITICAL  # 42.15 < 50
+      decision: SUSPEND_PENDING_REVIEW  # rule 1: mandatory ISO9001 EXPIRED
+
+  recovering:
+    - quarter: Q1
+      delivery: 30.00     # 100 x 10/20 - min(20, 2 x 10) = 50 - 20
+      quality: 40.00      # 120/2000 = 0.06 -> 100 x (1 - 0.6)
+      cost: 40.00         # 6 % overbilling: wavp 0.06 -> 100 x (1 - 0.6)
+      capacity: 28.00     # util 1.30 -> 70 - 70 x 0.6
+      compliance: 50.00   # ISO9001 EXPIRED (valid_to 2025-02-14 < C 2025-03-31) 0, ISO14001 100
+      disruption: 100.00  # attestation only (the Q2 signal is not yet observed)
+      overall: 42.80      # 9.00 + 10.00 + 6.00 + 2.80 + 5.00 + 10.00
+      category: CRITICAL  # 42.80 < 50
+      decision: SUSPEND_PENDING_REVIEW  # rule 1: mandatory ISO9001 EXPIRED
+    - quarter: Q2
+      delivery: 49.00     # 100 x 13/20 - min(20, 2 x 8) = 65 - 16
+      quality: 60.00      # 80/2000 = 0.04 -> 100 x 0.6
+      cost: 60.00         # 4 % overbilling: wavp 0.04 -> 100 x 0.6
+      capacity: 56.00     # util 1.10 -> 70 - 14
+      compliance: 100.00  # renewal recorded 2025-04-15, valid 2025-04-15..2026-12-31: COMPLIANT
+      disruption: 81.80   # HIGH, age 45 d, still open at C (resolved 2025-08-15 > C): 100 - 18.1959
+      overall: 62.48      # 14.70 + 15.00 + 9.00 + 5.60 + 10.00 + 8.18
+      category: AT_RISK
+      decision: MONITOR
+    - quarter: Q3
+      delivery: 70.00     # 100 x 16/20 - min(20, 2 x 5) = 80 - 10
+      quality: 80.00      # 40/2000 = 0.02 -> 100 x 0.8
+      cost: 80.00         # 2 % overbilling: wavp 0.02 -> 100 x 0.8
+      capacity: 85.00     # util 0.90 -> 100 - 15
+      compliance: 100.00  # (100 + 100)/2
+      disruption: 96.73   # RESOLVED (valid_to 2025-08-15 <= C), age 137 d: 100 - 30 x 0.5 x 0.2182264 = 100 - 3.2734 = 96.7266
+      overall: 81.17      # 21.00 + 20.00 + 12.00 + 8.50 + 10.00 + 9.673 = 81.173 -> 81.17
+      category: ACCEPTABLE
+      decision: APPROVED
+    - quarter: Q4
+      delivery: 89.00     # 100 x 19/20 - min(20, 2 x 3) = 95 - 6
+      quality: 95.00      # 10/2000 = 0.005 -> 100 x 0.95
+      cost: 100.00        # 0 % overbilling
+      capacity: 100.00    # util 0.70
+      compliance: 100.00  # (100 + 100)/2
+      disruption: 100.00  # the signal is 229 d old (> 180-day lookback); attestations only
+      overall: 95.45      # 26.70 + 23.75 + 15.00 + 10.00 + 10.00 + 10.00
+      category: HIGH
+      decision: PREFERRED
+
+# One-factor perturbations of the stable Q1 evidence (baseline: stable Q1 above, overall 96.05).
+# overall = 96.05 + weight x delta (component scores are 2 dp, so weight x delta is exact).
+one_factor:
+  delivery:     # late shipment 2 d -> 7 d late
+    score: 81.00    # 100 x 19/20 - min(20, 2 x 7) = 95 - 14
+    delta: -10.00   # 81.00 - 91.00
+    overall: 93.05  # 96.05 + 0.30 x (-10.00) = 96.05 - 3.00
+  quality:      # defects 10 -> 30 per 2,000 (0.5 % -> 1.5 %)
+    score: 85.00    # 30/2000 = 0.015 -> 100 x (1 - 0.15)
+    delta: -10.00   # 85.00 - 95.00
+    overall: 93.55  # 96.05 + 0.25 x (-10.00) = 96.05 - 2.50
+  cost:         # every invoice overbilled 3 %: 1000.00 -> 1030.00
+    score: 70.00    # wavp 600/20000 = 0.03 -> 100 x (1 - 0.3)
+    delta: -30.00   # 70.00 - 100.00
+    overall: 91.55  # 96.05 + 0.15 x (-30.00) = 96.05 - 4.50
+  capacity:     # demand 1200 -> 2400 per month against 2000 free: util 0.6 -> 1.2
+    score: 42.00    # 70 - 70 x (1.20 - 1.00)/0.50 = 70 - 28
+    delta: -58.00   # 42.00 - 100.00
+    overall: 90.25  # 96.05 + 0.10 x (-58.00) = 96.05 - 5.80
+  compliance:   # mandatory ISO9001 EXPIRED (valid_to 2025-02-14 < C 2025-03-31)
+    score: 50.00    # (0 + 100)/2
+    delta: -50.00   # 50.00 - 100.00
+    overall: 91.05  # 96.05 + 0.10 x (-50.00) = 96.05 - 5.00
+  disruption:   # + HIGH open signal observed 2025-02-14T23:59:59 (age 45 d at C)
+    score: 81.80    # 100 - 30 x exp(-0.5) = 100 - 18.1959 = 81.8041
+    delta: -18.20   # 81.80 - 100.00
+    overall: 94.23  # 96.05 + 0.10 x (-18.20) = 96.05 - 1.82
