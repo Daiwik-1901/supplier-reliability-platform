@@ -11,8 +11,6 @@ from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal
 from typing import Any
 
-import numpy as np
-
 from supplier_reliability.config import ProfileParams
 from supplier_reliability.domain.enums import (
     CapacityVerification,
@@ -37,7 +35,7 @@ from supplier_reliability.services.generator.constants import (
 )
 from supplier_reliability.services.generator.dataset import GeneratedDataset
 from supplier_reliability.services.generator.ids import IdRegistry
-from supplier_reliability.services.generator.profiles import assign_profiles
+from supplier_reliability.services.generator.profiles import assign_profiles, exact_subset
 from supplier_reliability.services.generator.rng import RandomSource
 
 __all__ = ["expected_monthly_demand", "generate_master_data"]
@@ -108,11 +106,6 @@ def expected_monthly_demand(
         / _n_months(cfg)
     )
     return _dec(units)
-
-
-def _exact_subset(rng: np.random.Generator, n: int, k: int) -> list[int]:
-    """k distinct indexes in [0, n), sorted (stable order; never iterate a set while drawing)."""
-    return sorted(int(i) for i in rng.permutation(n)[:k])
 
 
 def generate_master_data(
@@ -203,7 +196,7 @@ def _gen_sites(
                 }
             )
     k_inactive = min(len(extras), round(_INACTIVE_SITE_FRACTION * len(rows)))
-    for pos in _exact_subset(rng, len(extras), k_inactive):
+    for pos in exact_subset(rng, len(extras), k_inactive):
         row = rows[extras[pos]]
         row["site_status"] = SiteStatus.INACTIVE
         row["effective_to"] = ref_start + timedelta(days=int(rng.integers(59, 481)))
@@ -239,7 +232,7 @@ def _gen_contracts(
     for s in ds.sites:
         n_sites[s["supplier_id"]] = n_sites.get(s["supplier_id"], 0) + 1
     renewed = set(
-        _exact_subset(rng, len(ds.suppliers), round(_RENEWAL_FRACTION * len(ds.suppliers)))
+        exact_subset(rng, len(ds.suppliers), round(_RENEWAL_FRACTION * len(ds.suppliers)))
     )
     rows: list[dict[str, Any]] = []
     for i, sup in enumerate(ds.suppliers):
@@ -286,7 +279,7 @@ def _gen_contracts(
                 }
             )
     k_null = max(1, round(_NULL_CAPACITY_FRACTION * len(rows)))
-    for pos in _exact_subset(rng, len(rows), k_null):
+    for pos in exact_subset(rng, len(rows), k_null):
         rows[pos]["contracted_capacity"] = None
     ds.contracts.extend(rows)
 
@@ -479,7 +472,7 @@ def _gen_capacity(
     for s in ds.sites:
         sites_by_supplier.setdefault(s["supplier_id"], []).append(s)
     none_set = set(
-        _exact_subset(
+        exact_subset(
             rng, len(ds.suppliers), round(_NO_CAPACITY_SUPPLIER_FRACTION * len(ds.suppliers))
         )
     )

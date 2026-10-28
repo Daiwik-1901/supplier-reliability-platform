@@ -10,9 +10,13 @@ Rules:
 - ``recorded_timestamp = event_timestamp + lag`` (0-2 h normally, 1-10 days for ~5% of events).
   If that would exceed reference_end it is set to reference_end (still >= event_timestamp), so
   no generated record is "from the future".
+- Dispatch is spread over [booking, required - transit] (split j of k in order). When that
+  would fall after reference_end - 1 day, it is re-drawn uniformly over the whole allowed window
+  [booking + 1 h, reference_end - 1 day], so there is no artificial cluster at the period end.
 - Lateness uses the profile trend at fraction (expected - reference_start) / (reference_end -
-  reference_start), clamped to [0, 1]. A late shipment arrives more than the 24 h D5 grace after
-  expected; an on-time one arrives at most 12 h after expected.
+  reference_start), clamped to [0, 1]. The late/on-time boundary is the D5 grace
+  (``GeneratorConfig.grace_hours``, from ``scoring.grace_hours``): a late shipment arrives more
+  than the grace after expected; an on-time one at most grace/2 after expected.
 - Corrections: ~1% of delivered shipments get a CORRECTION event whose metadata is
   ``{"corrects_event_id": <ARRIVED id>, "field": "event_timestamp", "corrected_value": <ISO-8601
   UTC>}``, recorded strictly after the ARRIVED event was recorded. The corrected value differs
@@ -21,6 +25,12 @@ Rules:
   known) value because the shipment row is the current-state view; the original value remains
   on the ARRIVED event, and evidence collection (Task 9) applies a correction only when it was
   recorded <= the cutoff.
+- Because a correction moves the arrival by up to 48 h, for some corrected shipments (a subset
+  of the ~1%) the corrected arrival lies on the other side of the late boundary than the
+  original. The DELAYED event (present iff the originally recorded ARRIVED was late) can then
+  disagree with ``Shipment.actual_delivery_timestamp``. Both are internally consistent: DELAYED
+  always agrees with the ARRIVED event. Cutoff-aware logic must therefore read events by
+  recording time (ARRIVED, then any CORRECTION recorded <= cutoff) and never the shipment row.
 """
 
 from dataclasses import dataclass
@@ -35,7 +45,6 @@ from supplier_reliability.services.generator.dataset import GeneratedDataset
 from supplier_reliability.services.generator.ids import IdRegistry
 
 E = DeliveryEventType
-GRACE = timedelta(hours=24)
 _LATE_RECORDING_P = 0.05
 _CORRECTION_FRACTION = 0.01
 _SOURCE = {
@@ -73,6 +82,7 @@ def draw_timeline(
     profile: ProfileParams,
     ref_start: datetime,
     ref_end: datetime,
+    grace: timedelta,
 ) -> Timeline:
     """Shipment ``index`` of ``n_shipments`` for ``po``: split shipments dispatch in order."""
     booking = po["created_at"] + _minutes(rng, 60, 48 * 60)
@@ -83,8 +93,9 @@ def draw_timeline(
     frac = (index + float(rng.random())) / n_shipments
     dispatch = booking + timedelta(minutes=max(60, int(span_min * frac)))
     cap = ref_end - timedelta(days=1)  # leaves room for IN_TRANSIT inside the period
-    if dispatch > cap:
-        dispatch = max(booking + timedelta(hours=1), cap - _minutes(rng, 0, 72 * 60))
+    if dispatch > cap:  # re-draw uniformly over the whole allowed window [booking + 1 h, cap]
+        window_min = int((cap - booking).total_seconds() // 60)
+        dispatch = booking + _minutes(rng, 60, max(60, window_min))
     expected = dispatch + transit
     in_transit = dispatch + _minutes(rng, 60, 6 * 60)
     fraction = min(1.0, max(0.0, (expected - ref_start) / (ref_end - ref_start)))
@@ -92,13 +103,14 @@ def draw_timeline(
     delayed: datetime | None = None
     if late:
         mean_hours = profile.at("mean_late_days", fraction) * 24
-        extra_hours = float(rng.exponential(max(mean_hours - 24, 12.0)))
-        arrival = expected + GRACE + timedelta(minutes=1 + int(extra_hours * 60))
+        grace_hours = grace.total_seconds() / 3600
+        extra_hours = float(rng.exponential(max(mean_hours - grace_hours, 12.0)))
+        arrival = expected + grace + timedelta(minutes=1 + int(extra_hours * 60))
         delayed = expected - _minutes(rng, 0, 12 * 60)
         if delayed > ref_end:
             delayed = None
-    else:
-        arrival = expected + _minutes(rng, -36 * 60, 12 * 60)
+    else:  # at most grace/2 after expected (12 h with the default 24 h grace)
+        arrival = expected + _minutes(rng, -36 * 60, int(grace.total_seconds() // 120))
     received: datetime | None = min(arrival + _minutes(rng, 60, 24 * 60), ref_end)
     if arrival > ref_end:
         arrival = received = None

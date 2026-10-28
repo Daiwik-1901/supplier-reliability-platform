@@ -33,6 +33,8 @@ class GeneratorConfig(BaseModel):
     reference_start: datetime
     reference_end: datetime
     profiles: dict[str, ProfileParams]
+    # D5 on-time grace (from scoring.grace_hours): the generator's late/on-time boundary.
+    grace_hours: int
     anomaly_preset: AnomalyPreset
     e_cross_supplier_fraction: float
 
@@ -57,6 +59,7 @@ class GeneratorConfig(BaseModel):
             reference_start=datetime.fromisoformat(gen.reference_period["start"]),
             reference_end=datetime.fromisoformat(gen.reference_period["end"]),
             profiles=gen.profiles,
+            grace_hours=app_config.scoring.grace_hours,
             anomaly_preset=anomaly_preset,
             e_cross_supplier_fraction=app_config.anomalies.e_cross_supplier_fraction,
         )

@@ -11,6 +11,9 @@ Decisions (documented assumptions):
   matches the capacity sizing done by master data. Quantities are whole units.
 - A PO uses the supplier's contract in force at ``order_date``; its currency is the contract's,
   and each line's ``agreed_unit_price`` is that contract's price for the line's product.
+- Every allocation carries >= 1 unit: a line is split over at most its quantity in shipments,
+  and a PO has at most its total ordered units in shipments (``cap_shipment_counts`` keeps the
+  shipment total exact). Short-shipping always leaves shipped >= 1.
 - Every non-cancelled PO line is fully allocated (sum allocated = ordered). Shortfalls come
   from short-shipping (~3% of allocations) and rare in-transit losses, which leaves ~4% of
   fulfilled PO lines short.
@@ -48,8 +51,7 @@ from supplier_reliability.services.generator.constants import (
 )
 from supplier_reliability.services.generator.dataset import GeneratedDataset
 from supplier_reliability.services.generator.ids import IdRegistry
-from supplier_reliability.services.generator.master_data import _exact_subset
-from supplier_reliability.services.generator.profiles import allocate_exact
+from supplier_reliability.services.generator.profiles import allocate_exact, exact_subset
 from supplier_reliability.services.generator.rng import RandomSource
 from supplier_reliability.services.generator.transactions_events import (
     apply_corrections,
@@ -128,7 +130,7 @@ def _gen_orders(
             minute = int(rng.integers(8 * 60, 17 * 60))
             drafts.append((order_date, sup["supplier_id"], lead, minute, sup["supplier_category"]))
     drafts.sort(key=lambda d: (d[0], d[1]))  # stable: ties keep generation order
-    cancelled = set(_exact_subset(rng, len(drafts), round(_CANCEL_FRACTION * len(drafts))))
+    cancelled = set(exact_subset(rng, len(drafts), round(_CANCEL_FRACTION * len(drafts))))
 
     contracts: dict[str, list[dict[str, Any]]] = {}
     for c in ds.contracts:
@@ -188,25 +190,26 @@ def _plan_shipments(
     open_pos = [p for p in ds.purchase_orders if p["po_status"] != POStatus.CANCELLED]
     weights = np.array([len(lines_by_po[p["po_id"]]) for p in open_pos], dtype=float)
     counts = allocate_exact(cfg.n_shipments, weights, 1, rng, maximum=_MAX_SHIPMENTS_PER_PO)
+    # A PO cannot have more shipments than units ordered (each allocation carries >= 1 unit).
+    caps = np.array(
+        [
+            min(
+                _MAX_SHIPMENTS_PER_PO,
+                int(sum(x["ordered_quantity"] for x in lines_by_po[p["po_id"]])),
+            )
+            for p in open_pos
+        ]
+    )
+    counts = cap_shipment_counts(counts, caps, rng)
     plans: list[_ShipmentPlan] = []
     for po, k in zip(open_pos, counts, strict=True):
         k = int(k)
         lines = lines_by_po[po["po_id"]]
-        members = [[int(rng.integers(k))] for _ in lines]
-        for j in range(k):  # every shipment carries at least one line
-            if not any(j in m for m in members):
-                members[int(rng.integers(len(lines)))].append(j)
-        for m in members:  # some lines are split over one more shipment
-            if len(m) < k and float(rng.random()) < _EXTRA_SPLIT_P:
-                rest = [j for j in range(k) if j not in m]
-                m.append(rest[int(rng.integers(len(rest)))])
+        members = plan_line_memberships(rng, [int(x["ordered_quantity"]) for x in lines], k)
         po_plans = [_ShipmentPlan(po, j, k) for j in range(k)]
         for line, m in zip(lines, members, strict=True):
-            m.sort()
             qty = int(line["ordered_quantity"])
-            split = allocate_exact(
-                qty, alloc_rng.dirichlet(np.full(len(m), 2.0)), 1 if qty >= len(m) else 0, alloc_rng
-            )
+            split = allocate_exact(qty, alloc_rng.dirichlet(np.full(len(m), 2.0)), 1, alloc_rng)
             for j, q in zip(m, split, strict=True):
                 po_plans[j].allocations.append(
                     {
@@ -221,12 +224,64 @@ def _plan_shipments(
         plans.extend(po_plans)
 
     every = [a for p in plans for a in p.allocations]
-    for pos in _exact_subset(alloc_rng, len(every), round(_SHORT_SHIP_FRACTION * len(every))):
-        a = every[pos]
+    k_short = round(_SHORT_SHIP_FRACTION * len(every))
+    # Only allocations of >= 2 units can be short-shipped: shipped stays >= 1 (no allocation is
+    # fully short-shipped).
+    shortable = [a for a in every if a["allocated_quantity"] >= 2]
+    for pos in exact_subset(alloc_rng, len(shortable), min(k_short, len(shortable))):
+        a = shortable[pos]
         allocated = int(a["allocated_quantity"])
         cut = max(1, int(allocated * float(alloc_rng.uniform(0.05, 0.30))))
-        a["shipped_quantity"] = Decimal(max(0, allocated - cut))
+        a["shipped_quantity"] = Decimal(allocated - min(cut, allocated - 1))
     return plans
+
+
+def cap_shipment_counts(
+    counts: np.ndarray, caps: np.ndarray, rng: np.random.Generator
+) -> np.ndarray:
+    """Clip per-PO shipment counts to ``caps`` and hand the excess, one at a time, to random POs
+    with room, so the total stays exact. Draws nothing when no PO exceeds its cap."""
+    out = np.minimum(counts, caps).astype(np.int64)
+    excess = int(counts.sum() - out.sum())
+    while excess > 0:
+        room = np.flatnonzero(out < caps)
+        if len(room) == 0:
+            raise GeneratorCapacityError("not enough ordered units for the shipment count")
+        out[room[int(rng.integers(len(room)))]] += 1
+        excess -= 1
+    return out
+
+
+def plan_line_memberships(
+    rng: np.random.Generator, quantities: list[int], k: int
+) -> list[list[int]]:
+    """Which of the PO's ``k`` shipments carry each line (sorted shipment indexes per line).
+
+    Every line is on >= 1 and <= its quantity shipments (so each allocation gets >= 1 unit),
+    every shipment carries >= 1 line, and ~25% of lines split over one more shipment.
+    Requires k <= sum(quantities).
+    """
+    n = len(quantities)
+    cap = [min(q, k) for q in quantities]
+    members: list[list[int]] = [[] for _ in quantities]
+    if n >= k:  # the first k lines (random order) each open their own shipment
+        for pos, li in enumerate(rng.permutation(n)):
+            members[int(li)].append(pos if pos < k else int(rng.integers(k)))
+    else:  # one shipment per line, then fill the remaining shipments from lines with spare units
+        order = [int(j) for j in rng.permutation(k)]
+        for li in range(n):
+            members[li].append(order[li])
+        for j in order[n:]:
+            spare = [li for li in range(n) if len(members[li]) < cap[li]]
+            if not spare:
+                raise GeneratorCapacityError("shipments exceed the PO's ordered units")
+            members[spare[int(rng.integers(len(spare)))]].append(j)
+    for li, m in enumerate(members):
+        if len(m) < cap[li] and float(rng.random()) < _EXTRA_SPLIT_P:
+            rest = [j for j in range(k) if j not in m]
+            m.append(rest[int(rng.integers(len(rest)))])
+        m.sort()
+    return members
 
 
 def _gen_shipments(
@@ -240,6 +295,7 @@ def _gen_shipments(
     alloc_rng = rs.stream("allocations")
     event_rng = rs.stream("events")
     ref_start, ref_end = cfg.reference_start, cfg.reference_end
+    grace = timedelta(hours=cfg.grace_hours)
     sites: dict[str, list[dict[str, Any]]] = {}
     for s in ds.sites:
         if s["site_status"] == SiteStatus.ACTIVE:
@@ -248,7 +304,9 @@ def _gen_shipments(
     for plan in plans:
         po = plan.po
         profile = cfg.profiles[ds.supplier_profiles[po["supplier_id"]]]
-        tl = draw_timeline(rng, po, plan.index, plan.n_shipments, profile, ref_start, ref_end)
+        tl = draw_timeline(
+            rng, po, plan.index, plan.n_shipments, profile, ref_start, ref_end, grace
+        )
         d = tl.dispatch.date()
         eligible = [
             s

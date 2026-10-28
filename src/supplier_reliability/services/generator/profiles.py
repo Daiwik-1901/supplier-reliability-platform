@@ -23,6 +23,11 @@ def assign_profiles(n: int, shares: dict[str, float], rng: np.random.Generator) 
     return [labels[i] for i in order]
 
 
+def exact_subset(rng: np.random.Generator, n: int, k: int) -> list[int]:
+    """k distinct indexes in [0, n), sorted (stable order; never iterate a set while drawing)."""
+    return sorted(int(i) for i in rng.permutation(n)[:k])
+
+
 def allocate_exact(
     total: int,
     weights: np.ndarray,

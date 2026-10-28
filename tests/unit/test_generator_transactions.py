@@ -35,11 +35,16 @@ from supplier_reliability.services.generator.transactions import generate_orders
 E = DeliveryEventType
 REF_START = datetime(2025, 1, 1, tzinfo=UTC)
 REF_END = datetime(2026, 6, 30, 23, 59, 59, tzinfo=UTC)
-GRACE = timedelta(hours=24)
 
 
-def _run(app_config, preset="starter", seed=None):
+def _grace(ds):
+    return timedelta(hours=ds.config.grace_hours)
+
+
+def _run(app_config, preset="starter", seed=None, **overrides):
     cfg = GeneratorConfig.from_app_config(app_config, preset, seed)
+    if overrides:
+        cfg = cfg.model_copy(update=overrides)
     rs = RandomSource(cfg.seed)
     ids = IdRegistry()
     ds = GeneratedDataset(config=cfg)
@@ -78,7 +83,7 @@ def _late_rates(ds, profile):
         exp = s["expected_delivery_timestamp"]
         half = (exp.year, 1 if exp.month <= 6 else 2)
         counts[half][1] += 1
-        if s["actual_delivery_timestamp"] > exp + GRACE:
+        if s["actual_delivery_timestamp"] > exp + _grace(ds):
             counts[half][0] += 1
     return {h: late / n for h, (late, n) in counts.items()}, counts
 
@@ -318,24 +323,28 @@ def test_events_within_period_and_recorded_not_before_event(starter):
     assert 0.02 <= lagged / len(ds.delivery_events) <= 0.09
 
 
-def test_delayed_event_only_for_late_shipments(starter):
-    _, ds = starter
+def _assert_delayed_matches_arrived_event(ds):
+    """DELAYED exists iff the ARRIVED *event* (originally recorded arrival) is past grace."""
+    grace = _grace(ds)
     ships = {s["shipment_id"]: s for s in ds.shipments}
-    evs = _events_by_shipment(ds)
     n_delayed = 0
-    for sid, events in evs.items():
+    for sid, events in _events_by_shipment(ds).items():
         s = ships[sid]
         by_type = {e["event_type"]: e for e in events}
         if E.DELAYED in by_type:
             n_delayed += 1
             if E.ARRIVED in by_type:
-                assert by_type[E.DELAYED]["event_timestamp"] < by_type[E.ARRIVED]["event_timestamp"]
-                assert (
-                    by_type[E.ARRIVED]["event_timestamp"] > s["expected_delivery_timestamp"] + GRACE
-                )
+                arrived = by_type[E.ARRIVED]["event_timestamp"]
+                assert by_type[E.DELAYED]["event_timestamp"] < arrived
+                assert arrived > s["expected_delivery_timestamp"] + grace
         elif E.ARRIVED in by_type:
-            assert by_type[E.ARRIVED]["event_timestamp"] <= s["expected_delivery_timestamp"] + GRACE
-    assert n_delayed > 0
+            assert by_type[E.ARRIVED]["event_timestamp"] <= s["expected_delivery_timestamp"] + grace
+    return n_delayed
+
+
+def test_delayed_event_only_for_late_shipments(starter):
+    _, ds = starter
+    assert _assert_delayed_matches_arrived_event(ds) > 0
 
 
 def test_in_transit_shipments_have_no_arrival(starter):
@@ -516,3 +525,111 @@ def test_orders_and_shipments_deterministic(app_config, starter):
         assert getattr(a, t) == getattr(b, t), t
     _, c = _run(app_config, seed=7)
     assert c.shipments != a.shipments
+
+
+# --- fix round 1 ------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("preset", ["starter", "full"])
+def test_no_zero_quantity_allocations_and_no_empty_shipments(request, preset):
+    _, ds = request.getfixturevalue(preset)
+    assert min(a["allocated_quantity"] for a in ds.shipment_lines) >= 1
+    assert min(a["shipped_quantity"] for a in ds.shipment_lines) >= 1
+    n = defaultdict(int)
+    for a in ds.shipment_lines:
+        n[a["shipment_id"]] += 1
+    assert all(n[s["shipment_id"]] >= 1 for s in ds.shipments)
+
+
+def test_line_memberships_respect_quantity_and_cover_every_shipment():
+    import numpy as np
+
+    from supplier_reliability.services.generator.transactions import plan_line_memberships
+
+    rng = np.random.default_rng(5)
+    cases = [([1], 1), ([1, 1], 2), ([1, 3], 4), ([2, 1, 1], 4), ([1, 1, 1, 1, 1], 4), ([4], 4)]
+    for _ in range(300):
+        qtys = [int(q) for q in rng.integers(1, 4, size=int(rng.integers(1, 6)))]
+        cases.append((qtys, int(rng.integers(1, min(4, sum(qtys)) + 1))))
+    for qtys, k in cases:
+        members = plan_line_memberships(rng, qtys, k)
+        assert len(members) == len(qtys)
+        for q, m in zip(qtys, members, strict=True):
+            assert 1 <= len(m) <= q
+            assert len(set(m)) == len(m) and all(0 <= j < k for j in m)
+        assert {j for m in members for j in m} == set(range(k)), (qtys, k, members)
+
+
+def test_cap_shipment_counts_keeps_total_and_respects_caps():
+    import numpy as np
+
+    from supplier_reliability.services.generator.transactions import cap_shipment_counts
+
+    rng = np.random.default_rng(3)
+    counts = np.array([4, 4, 1, 2, 3])
+    caps = np.array([1, 2, 4, 4, 4])
+    out = cap_shipment_counts(counts, caps, rng)
+    assert int(out.sum()) == int(counts.sum())
+    assert (out >= 1).all() and (out <= caps).all()
+    same = cap_shipment_counts(np.array([2, 3]), np.array([4, 4]), rng)
+    assert same.tolist() == [2, 3]
+
+
+def test_generator_config_grace_hours_comes_from_scoring_config(app_config):
+    cfg = GeneratorConfig.from_app_config(app_config, "starter")
+    assert cfg.grace_hours == app_config.scoring.grace_hours
+    data = app_config.model_dump(mode="json")
+    data["scoring"]["grace_hours"] = app_config.scoring.grace_hours + 24
+    changed = GeneratorConfig.from_app_config(type(app_config).model_validate(data), "starter")
+    assert changed.grace_hours == app_config.scoring.grace_hours + 24
+    assert changed.config_hash() != cfg.config_hash()
+
+
+def test_late_boundary_follows_configured_grace(app_config):
+    grace_hours = app_config.scoring.grace_hours + 48
+    _, ds = _run(app_config, grace_hours=grace_hours)
+    assert ds.config.grace_hours == grace_hours
+    assert _assert_delayed_matches_arrived_event(ds) > 0
+
+
+def test_exact_subset_is_public_in_profiles():
+    import numpy as np
+
+    from supplier_reliability.services.generator.profiles import exact_subset
+
+    a = exact_subset(np.random.default_rng(1), 20, 5)
+    expected = sorted(int(i) for i in np.random.default_rng(1).permutation(20)[:5])
+    assert a == expected
+
+
+def test_corrections_can_cross_late_boundary_but_events_stay_consistent(full):
+    _, ds = full
+    grace = _grace(ds)
+    by_id = {e["delivery_event_id"]: e for e in ds.delivery_events}
+    ships = {s["shipment_id"]: s for s in ds.shipments}
+    evs = _events_by_shipment(ds)
+    crossed = 0
+    for c in ds.delivery_events:
+        if c["event_type"] != E.CORRECTION:
+            continue
+        s = ships[c["shipment_id"]]
+        deadline = s["expected_delivery_timestamp"] + grace
+        original = by_id[c["event_metadata"]["corrects_event_id"]]["event_timestamp"]
+        corrected = s["actual_delivery_timestamp"]
+        has_delayed = any(e["event_type"] == E.DELAYED for e in evs[s["shipment_id"]])
+        assert has_delayed == (original > deadline)  # DELAYED follows the ARRIVED event
+        if (original > deadline) != (corrected > deadline):
+            crossed += 1
+    assert crossed > 0
+    _assert_delayed_matches_arrived_event(ds)
+
+
+def test_end_of_period_dispatches_not_clustered(full):
+    _, ds = full
+    cap = REF_END - timedelta(days=1)
+    window = timedelta(hours=72)
+    start, end = REF_START + timedelta(days=60), REF_END - timedelta(days=60)
+    mid = sum(start <= s["dispatch_timestamp"] < end for s in ds.shipments)
+    per_window = mid / ((end - start) / window)
+    last = sum(cap - window < s["dispatch_timestamp"] <= cap for s in ds.shipments)
+    assert last <= 1.5 * per_window, (last, per_window)
