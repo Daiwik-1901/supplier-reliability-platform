@@ -6,19 +6,13 @@ data directory for the latest dataset (`generated/<preset>/`, `ground_truth/<pre
 paths themselves are never returned. "No evaluation available" (404) means there is no dataset,
 or its ground-truth file / export directory is not present in this server's data directory."""
 
-import re
-from dataclasses import dataclass
-from datetime import datetime
-from decimal import Decimal
-from pathlib import Path
+import contextlib
 from typing import Any
 
 from fastapi import APIRouter, HTTPException
-from sqlalchemy.orm import Session
 
 from supplier_reliability.api.dependencies import AppConfigDep, DbDep, SettingsDep
 from supplier_reliability.api.errors import MAX_LISTED_IDS, error_responses
-from supplier_reliability.repositories import jobs as jobs_repo
 from supplier_reliability.repositories import validation as validation_repo
 from supplier_reliability.schemas.reports import (
     AnomalyEvaluationOut,
@@ -26,73 +20,29 @@ from supplier_reliability.schemas.reports import (
     EvaluationRunOut,
     ReconciliationOut,
 )
-from supplier_reliability.services.anomalies import batch_id_for
-from supplier_reliability.services.anomalies.injector import GROUND_TRUTH_FILE
-from supplier_reliability.services.evaluation import (
-    AnomalyEvaluation,
-    ConfusionCounts,
-    evaluate_anomalies,
-    reconcile_scores,
+from supplier_reliability.services.evaluation import ConfusionCounts
+from supplier_reliability.services.evaluation.runner import (
+    NoEvaluationAvailable,
+    anomaly_report,
+    resolve_inputs,
+    run_evaluation,
 )
 from supplier_reliability.services.reporting import (
-    anomaly_evaluation_report,
     data_quality,
     deteriorating_suppliers,
     entity_counts,
     summary,
     supplier_rankings,
 )
-from supplier_reliability.services.scoring.evidence import scorecard_windows
 
 router = APIRouter(prefix="/api/v1/reports", tags=["reports"])
 evaluation_router = APIRouter(prefix="/api/v1/evaluation", tags=["evaluation"])
 
 NO_EVALUATION = "no evaluation available"
-_PRESET = re.compile(r"^[a-z0-9_-]{1,32}$")
-
-
-@dataclass(frozen=True)
-class EvaluationInputs:
-    dataset_id: str
-    batch_id: str
-    ground_truth: Path
-    export_dir: Path
 
 
 def _not_found(message: str) -> HTTPException:
     return HTTPException(status_code=404, detail=message)
-
-
-def _inputs(db: Session, data_dir: Path) -> EvaluationInputs:
-    """Latest dataset's ground truth and export directory, or 404 "no evaluation available"."""
-    row = jobs_repo.latest_manifest(db)
-    preset = None if row is None else row.manifest.get("preset")
-    if row is None or not isinstance(preset, str) or not _PRESET.match(preset):
-        raise _not_found(NO_EVALUATION)
-    return EvaluationInputs(
-        dataset_id=row.dataset_id,
-        batch_id=batch_id_for(row.dataset_id),
-        ground_truth=Path(data_dir) / "ground_truth" / preset / GROUND_TRUTH_FILE,
-        export_dir=Path(data_dir) / "generated" / preset,
-    )
-
-
-def _evaluate(db: Session, inputs: EvaluationInputs) -> AnomalyEvaluation:
-    if not inputs.ground_truth.is_file():
-        raise _not_found(NO_EVALUATION)
-    try:
-        return evaluate_anomalies(db, inputs.batch_id, inputs.ground_truth)
-    except ValueError as exc:  # empty or unknown raw batch
-        raise _not_found(NO_EVALUATION) from exc
-
-
-def _anomaly_report(db: Session, inputs: EvaluationInputs) -> dict[str, Any]:
-    if not inputs.ground_truth.is_file():
-        raise _not_found(NO_EVALUATION)
-    try:
-        return anomaly_evaluation_report(db, inputs.batch_id, inputs.ground_truth)
-    except ValueError as exc:  # empty or unknown raw batch
-        raise _not_found(NO_EVALUATION) from exc
 
 
 def _confusion(cc: ConfusionCounts) -> ConfusionOut:
@@ -119,11 +69,9 @@ def get_summary(db: DbDep, config: AppConfigDep, settings: SettingsDep) -> dict[
             "deteriorating_suppliers": deteriorating_suppliers(db, threshold=threshold),
         }
         run_id = validation_repo.latest_run_id(db)
-        try:
-            inputs = _inputs(db, settings.data_dir)
-            built["anomaly_evaluation"] = _anomaly_report(db, inputs)
-        except HTTPException:
-            pass  # no ground truth here: the summary simply omits the anomaly figures
+        # no ground truth here: the summary simply omits the anomaly figures
+        with contextlib.suppress(NoEvaluationAvailable):
+            built["anomaly_evaluation"] = anomaly_report(db, resolve_inputs(db, settings.data_dir))
         return summary(db, run_id, reports=built, threshold=threshold)
     except LookupError as exc:
         raise _not_found("no data available for this report") from exc
@@ -169,7 +117,10 @@ def get_data_quality(db: DbDep) -> dict[str, Any]:
     responses=error_responses(404),
 )
 def get_anomaly_evaluation(db: DbDep, settings: SettingsDep) -> dict[str, Any]:
-    return _anomaly_report(db, _inputs(db, settings.data_dir))
+    try:
+        return anomaly_report(db, resolve_inputs(db, settings.data_dir))
+    except NoEvaluationAvailable as exc:
+        raise _not_found(NO_EVALUATION) from exc
 
 
 @evaluation_router.post(
@@ -183,21 +134,14 @@ def get_anomaly_evaluation(db: DbDep, settings: SettingsDep) -> dict[str, Any]:
     "404 `no evaluation available` when there is no dataset, ground truth or export.",
     responses=error_responses(404),
 )
-def run_evaluation(db: DbDep, config: AppConfigDep, settings: SettingsDep) -> EvaluationRunOut:
-    inputs = _inputs(db, settings.data_dir)
-    anomalies = _evaluate(db, inputs)
-    if not inputs.export_dir.is_dir():
-        raise _not_found(NO_EVALUATION)
-    period = config.generator.reference_period
-    windows = scorecard_windows(
-        datetime.fromisoformat(period["start"]),
-        datetime.fromisoformat(period["end"]),
-        config.scoring.window_months,
-    )
-    tolerance = Decimal(0)
-    rec = reconcile_scores(db, inputs.export_dir, windows, tolerance=tolerance)
+def run(db: DbDep, config: AppConfigDep, settings: SettingsDep) -> EvaluationRunOut:
+    try:
+        result = run_evaluation(db, config, resolve_inputs(db, settings.data_dir))
+    except NoEvaluationAvailable as exc:
+        raise _not_found(NO_EVALUATION) from exc
+    anomalies, rec = result.anomalies, result.reconciliation
     return EvaluationRunOut(
-        dataset_id=inputs.dataset_id,
+        dataset_id=result.dataset_id,
         anomaly_evaluation=AnomalyEvaluationOut(
             unit=anomalies.unit,
             per_class={i.value: _confusion(c) for i, c in anomalies.per_class.items()},
@@ -205,7 +149,7 @@ def run_evaluation(db: DbDep, config: AppConfigDep, settings: SettingsDep) -> Ev
             negative_population={i.value: n for i, n in anomalies.negative_population.items()},
         ),
         reconciliation=ReconciliationOut(
-            tolerance=str(tolerance),
+            tolerance=str(result.tolerance),
             checked=rec.checked,
             matched=rec.matched,
             mismatches_count=rec.checked - rec.matched,

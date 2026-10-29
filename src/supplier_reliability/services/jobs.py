@@ -12,7 +12,12 @@ single-instance prototype. It is not a durable or distributed job system.
   cannot both be accepted. The guarantee does not hold across processes.
 - Timestamps are wall-clock UTC (the pipeline itself uses deterministic clocks for the data).
 - ``current_stage`` of a running job is an in-memory, best-effort value kept in
-  ``app.state.job_stages``; it is lost on restart.
+  ``app.state.job_stages``; it is lost on restart and the entry is dropped as soon as the
+  job reaches a terminal state, so the dict only ever holds running jobs (bounded).
+- A terminal-state write (SUCCEEDED/FAILED) is retried once with a fresh session; if even
+  that fails a CRITICAL line (job id and exception class only) is logged. A failed SUCCEEDED
+  write falls through to a FAILED write, so a job is never stranded RUNNING (which would
+  block all generation until restart) unless the database itself is unwritable.
 - ``error_message`` is sanitised: only exception class names (and the failing pipeline stage)
   are stored, never ``str(exc)``, paths, tracebacks or the database URL. Full details go to the
   server log."""
@@ -28,7 +33,6 @@ from typing import Protocol
 from fastapi import BackgroundTasks
 from sqlalchemy.orm import Session, sessionmaker
 
-from supplier_reliability.api.errors import ConflictError
 from supplier_reliability.config import AppConfig, Settings
 from supplier_reliability.repositories import jobs as repo
 from supplier_reliability.services.pipeline import PipelineStageError, run_pipeline
@@ -36,8 +40,13 @@ from supplier_reliability.services.pipeline import PipelineStageError, run_pipel
 logger = logging.getLogger(__name__)
 
 INTERRUPTED_MESSAGE = "interrupted by restart"
+UNRECORDED_MESSAGE = "result could not be recorded"
 
 _SUBMIT_LOCK = threading.Lock()
+
+
+class JobConflictError(Exception):
+    """A generation request conflicts with current state (the API maps it to HTTP 409)."""
 
 
 class JobRunner(Protocol):
@@ -89,9 +98,9 @@ def request_generation(
     then the job is handed to `runner`. Returns the new job id."""
     with _SUBMIT_LOCK:
         if repo.active_job_exists(session):
-            raise ConflictError("a dataset generation job is already queued or running")
+            raise JobConflictError("a dataset generation job is already queued or running")
         if repo.canonical_data_exists(session) and not replace_existing:
-            raise ConflictError(
+            raise JobConflictError(
                 "a dataset is already loaded; set replace_existing to true to replace it"
             )
         job_id = repo.next_job_id(session)
@@ -101,10 +110,38 @@ def request_generation(
     return job_id
 
 
+def _record(ctx: JobContext, job_id: str, write: Callable[[Session], None]) -> bool:
+    """Run a terminal-state write in its own session; one retry with a fresh session. Logs only
+    the job id and exception class (CRITICAL when both attempts fail)."""
+    for attempt in (1, 2):
+        try:
+            with ctx.session_factory() as s:
+                write(s)
+                s.commit()
+            return True
+        except Exception as exc:  # noqa: BLE001 - never let a bookkeeping failure escape
+            level = logging.CRITICAL if attempt == 2 else logging.WARNING
+            logger.log(
+                level,
+                "recording terminal state of job %s failed (attempt %d): %s",
+                job_id,
+                attempt,
+                type(exc).__name__,
+            )
+    return False
+
+
 def run_generation_job(
     ctx: JobContext, job_id: str, preset: str, seed: int, replace_existing: bool
 ) -> None:
     """The background function. Uses its own sessions, never the request's."""
+    try:
+        _execute(ctx, job_id, preset, seed, replace_existing)
+    finally:
+        ctx.stages.pop(job_id, None)  # keep the in-memory dict bounded to running jobs
+
+
+def _execute(ctx: JobContext, job_id: str, preset: str, seed: int, replace_existing: bool) -> None:
     try:
         with ctx.session_factory() as s:
             repo.mark_running(s, job_id, ctx.clock())
@@ -118,14 +155,15 @@ def run_generation_job(
             on_progress=lambda stage: ctx.stages.__setitem__(job_id, stage),
         )
     except Exception as exc:  # noqa: BLE001 - any failure is recorded on the job, never raised
-        logger.error("dataset job %s failed", job_id, exc_info=exc)
-        with ctx.session_factory() as s:
-            repo.mark_failed(s, job_id, ctx.clock(), sanitise_error(exc))
-            s.commit()
+        # the original error's class is logged first; full details only in the traceback
+        logger.error("dataset job %s failed: %s", job_id, type(exc).__name__, exc_info=exc)
+        message = sanitise_error(exc)
+        _record(ctx, job_id, lambda s: repo.mark_failed(s, job_id, ctx.clock(), message))
         return
-    with ctx.session_factory() as s:
-        repo.mark_succeeded(s, job_id, ctx.clock(), result.dataset_id)
-        s.commit()
+    if not _record(
+        ctx, job_id, lambda s: repo.mark_succeeded(s, job_id, ctx.clock(), result.dataset_id)
+    ):
+        _record(ctx, job_id, lambda s: repo.mark_failed(s, job_id, ctx.clock(), UNRECORDED_MESSAGE))
 
 
 def recover_interrupted_jobs(

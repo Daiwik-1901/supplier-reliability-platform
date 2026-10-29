@@ -5,8 +5,7 @@ Generation runs the whole pipeline as a PROCESS-LOCAL background task (see
 unfinished by a restart are marked FAILED at startup). Responses never contain filesystem paths:
 manifest paths are made relative to the data directory and job errors are sanitised."""
 
-import re
-from pathlib import Path, PurePath, PureWindowsPath
+from pathlib import Path
 from typing import Annotated, Any
 
 from fastapi import APIRouter, Depends, Request, Response
@@ -19,11 +18,22 @@ from supplier_reliability.api.dependencies import (
     get_job_context,
     get_job_runner,
 )
-from supplier_reliability.api.errors import InvalidRequestError, NotFoundError, error_responses
+from supplier_reliability.api.errors import (
+    ConflictError,
+    InvalidRequestError,
+    NotFoundError,
+    error_responses,
+)
 from supplier_reliability.domain.enums import JobStatus
 from supplier_reliability.repositories import jobs as repo
 from supplier_reliability.schemas.datasets import GenerateRequest, JobAcceptedOut, JobOut
-from supplier_reliability.services.jobs import JobContext, JobRunner, request_generation
+from supplier_reliability.services.datasets import relativise_paths
+from supplier_reliability.services.jobs import (
+    JobConflictError,
+    JobContext,
+    JobRunner,
+    request_generation,
+)
 
 router = APIRouter(prefix="/api/v1/datasets", tags=["datasets"])
 
@@ -34,36 +44,6 @@ DatasetIdPath = Annotated[
         pattern=r"^[A-Za-z0-9-]{1,64}$", max_length=64, examples=["DS-starter-20261022-1a2b3c4d"]
     ),
 ]
-
-_WINDOWS_ABSOLUTE = re.compile(r"^[A-Za-z]:[\\/]")
-
-
-def _is_absolute(text: str) -> bool:
-    return text.startswith(("/", "\\")) or bool(_WINDOWS_ABSOLUTE.match(text))
-
-
-def _relative(text: str, data_dir: Path) -> str:
-    """An absolute path made relative to `data_dir`; outside it, only the final name is kept."""
-    for base in (data_dir, data_dir.resolve()):
-        try:
-            rel = PurePath(text).relative_to(base)
-        except ValueError:
-            continue
-        if rel.parts:
-            return rel.as_posix()
-    return PureWindowsPath(text).name
-
-
-def relativise_paths(value: Any, data_dir: Path) -> Any:
-    """Copy of a JSON value in which every string that looks like an absolute path is replaced
-    by a data-dir-relative one (defence in depth: the pipeline already stores relative paths)."""
-    if isinstance(value, dict):
-        return {k: relativise_paths(v, data_dir) for k, v in value.items()}
-    if isinstance(value, list):
-        return [relativise_paths(v, data_dir) for v in value]
-    if isinstance(value, str) and _is_absolute(value):
-        return _relative(value, data_dir)
-    return value
 
 
 @router.post(
@@ -93,7 +73,10 @@ def generate(
             ["body", "preset"], f"Input should be one of: {', '.join(sorted(presets))}"
         )
     seed = ctx.app_config.generator.seed if body.seed is None else body.seed
-    job_id = request_generation(db, ctx, runner, body.preset, seed, body.replace_existing)
+    try:
+        job_id = request_generation(db, ctx, runner, body.preset, seed, body.replace_existing)
+    except JobConflictError as exc:
+        raise ConflictError(str(exc)) from exc
     response.headers["Location"] = f"/api/v1/datasets/jobs/{job_id}"
     return JobAcceptedOut(job_id=job_id, status=JobStatus.QUEUED)
 

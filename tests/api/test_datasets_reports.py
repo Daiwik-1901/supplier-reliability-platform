@@ -1,5 +1,6 @@
 """Task 21 API tests: dataset generation jobs, manifests, live reports and evaluation."""
 
+import hashlib
 import shutil
 from datetime import UTC, datetime
 from decimal import Decimal
@@ -7,6 +8,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
+import sqlalchemy as sa
 from fastapi.testclient import TestClient
 
 from supplier_reliability.api.dependencies import get_job_runner
@@ -14,9 +16,11 @@ from supplier_reliability.config import AppConfig, Settings
 from supplier_reliability.database import run_migrations
 from supplier_reliability.domain.enums import JobStatus
 from supplier_reliability.main import create_app
-from supplier_reliability.models import DatasetJob, DatasetManifest
+from supplier_reliability.models import Base, DatasetJob, DatasetManifest
+from supplier_reliability.repositories import jobs as jobs_repo
 from supplier_reliability.services.anomalies import batch_id_for
 from supplier_reliability.services.anomalies.injector import GROUND_TRUTH_FILE
+from supplier_reliability.services.datasets import relativise_paths
 from supplier_reliability.services.evaluation import evaluate_anomalies
 from supplier_reliability.services.jobs import InlineRunner
 from supplier_reliability.services.pipeline import PipelineStageError
@@ -77,7 +81,7 @@ def test_generate_job_lifecycle(empty_inline):
     assert job["error_message"] is None
     assert job["started_at"].endswith("Z") and job["finished_at"].endswith("Z")
     assert job["started_at"] <= job["finished_at"]
-    assert job["current_stage"] == "manifest"
+    assert job["current_stage"] is None  # stage entries are dropped at a terminal state
     dataset_id = job["dataset_id"]
     assert dataset_id.startswith("DS-starter-20261022-")
 
@@ -91,6 +95,9 @@ def test_generate_job_lifecycle(empty_inline):
     again = empty_inline.post(GENERATE, json={"preset": "starter"})
     assert again.status_code == 409
     assert again.json()["error"]["code"] == "conflict"
+    assert again.json()["error"]["message"] == (
+        "a dataset is already loaded; set replace_existing to true to replace it"
+    )
 
 
 # --- generate: validation, conflicts ------------------------------------------------------------
@@ -108,9 +115,7 @@ def test_generate_conflict_when_job_running(empty_inline, replace):
     _add_job(empty_inline, "JOB-000007", JobStatus.RUNNING, started_at=NOW)
     r = empty_inline.post(GENERATE, json={"preset": "starter", "replace_existing": replace})
     assert r.status_code == 409
-    assert "running" in r.json()["error"]["message"].lower() or "queued" in (
-        r.json()["error"]["message"].lower()
-    )
+    assert r.json()["error"]["message"] == ("a dataset generation job is already queued or running")
 
 
 def test_generate_conflict_when_job_queued(empty_inline):
@@ -135,11 +140,12 @@ def test_generate_rejects_invalid_body(empty_inline, body):
 
 
 def test_generate_passes_options_and_numbers_jobs(api_client, monkeypatch):
-    calls = []
+    calls, seen = [], []
 
     def fake(settings, app_config, preset, seed, replace_existing, on_progress=None):
         calls.append((preset, seed, replace_existing))
         on_progress("generate")
+        seen.append(api_client.app.state.job_stages.get("JOB-000001"))
         return SimpleNamespace(dataset_id="DS-fake-1-abcd1234")
 
     monkeypatch.setattr("supplier_reliability.services.jobs.run_pipeline", fake)
@@ -147,9 +153,11 @@ def test_generate_passes_options_and_numbers_jobs(api_client, monkeypatch):
     r = api_client.post(GENERATE, json={"preset": "full", "seed": 7, "replace_existing": True})
     assert r.status_code == 202 and r.json()["job_id"] == "JOB-000001"
     assert calls == [("full", 7, True)]
+    assert seen == ["generate"]  # visible to the job endpoint while running
+    assert "JOB-000001" not in api_client.app.state.job_stages
     job = _job(api_client, "JOB-000001")
     assert job["status"] == "SUCCEEDED" and job["dataset_id"] == "DS-fake-1-abcd1234"
-    assert job["current_stage"] == "generate"
+    assert job["current_stage"] is None
     second = api_client.post(GENERATE, json={"preset": "starter", "replace_existing": True})
     assert second.json()["job_id"] == "JOB-000002"
 
@@ -178,6 +186,86 @@ def test_failed_job_reports_sanitized_error(empty_inline, monkeypatch, exc, expe
     assert empty_inline.post(GENERATE, json={"preset": "starter"}).status_code == 202
 
 
+# --- terminal-state writes never strand a job ------------------------------------------------
+
+
+def _fake_pipeline(monkeypatch):
+    monkeypatch.setattr(
+        "supplier_reliability.services.jobs.run_pipeline",
+        lambda *a, **k: SimpleNamespace(dataset_id="DS-fake-1-abcd1234"),
+    )
+
+
+def _failing_pipeline(monkeypatch):
+    def boom(*args, **kwargs):
+        raise ValueError("original pipeline error /secret/path")
+
+    monkeypatch.setattr("supplier_reliability.services.jobs.run_pipeline", boom)
+
+
+def _flaky(real, failures: int):
+    state = {"left": failures}
+
+    def wrapper(*args, **kwargs):
+        if state["left"] > 0:
+            state["left"] -= 1
+            raise RuntimeError("database is locked secret-token")
+        return real(*args, **kwargs)
+
+    return wrapper
+
+
+def _accepts_new_request(client: TestClient) -> bool:
+    return (
+        client.post(GENERATE, json={"preset": "starter", "replace_existing": True}).status_code
+        == 202
+    )
+
+
+def test_success_write_failing_once_is_retried(empty_inline, monkeypatch):
+    _fake_pipeline(monkeypatch)
+    monkeypatch.setattr(jobs_repo, "mark_succeeded", _flaky(jobs_repo.mark_succeeded, 1))
+    assert empty_inline.post(GENERATE, json={"preset": "starter"}).status_code == 202
+    job = _job(empty_inline, "JOB-000001")
+    assert job["status"] == "SUCCEEDED" and job["dataset_id"] == "DS-fake-1-abcd1234"
+    assert _accepts_new_request(empty_inline)
+
+
+def test_success_write_failing_twice_falls_through_to_failed(empty_inline, monkeypatch):
+    _fake_pipeline(monkeypatch)
+    monkeypatch.setattr(jobs_repo, "mark_succeeded", _flaky(jobs_repo.mark_succeeded, 99))
+    assert empty_inline.post(GENERATE, json={"preset": "starter"}).status_code == 202
+    job = _job(empty_inline, "JOB-000001")
+    assert job["status"] == "FAILED"  # never left RUNNING
+    assert "secret-token" not in str(job)
+    assert _accepts_new_request(empty_inline)  # no permanent 409
+
+
+def test_failed_write_failing_once_still_ends_failed(empty_inline, monkeypatch, caplog):
+    _failing_pipeline(monkeypatch)
+    monkeypatch.setattr(jobs_repo, "mark_failed", _flaky(jobs_repo.mark_failed, 1))
+    with caplog.at_level("ERROR"):
+        assert empty_inline.post(GENERATE, json={"preset": "starter"}).status_code == 202
+    job = _job(empty_inline, "JOB-000001")
+    assert job["status"] == "FAILED" and job["error_message"] == "ValueError"
+    # the original error's class is logged (message only: no str(exc)) before any write
+    messages = [r.getMessage() for r in caplog.records]
+    assert any("ValueError" in m for m in messages)
+    assert not any("/secret/path" in m for m in messages)
+    assert _accepts_new_request(empty_inline)
+
+
+def test_failed_write_failing_always_logs_critical_without_secrets(
+    empty_inline, monkeypatch, caplog
+):
+    _failing_pipeline(monkeypatch)
+    monkeypatch.setattr(jobs_repo, "mark_failed", _flaky(jobs_repo.mark_failed, 99))
+    assert empty_inline.post(GENERATE, json={"preset": "starter"}).status_code == 202
+    critical = [r for r in caplog.records if r.levelname == "CRITICAL"]
+    assert critical and "JOB-000001" in critical[0].getMessage()
+    assert "secret-token" not in critical[0].getMessage()
+
+
 # --- jobs and manifests: lookups ----------------------------------------------------------------
 
 
@@ -186,7 +274,8 @@ def test_job_and_manifest_lookup_errors(empty_api_client):
     assert empty_api_client.get(f"{JOBS}/job_1;drop").status_code == 422
     assert empty_api_client.get(f"{MANIFESTS}/DS-starter-1-abcd1234").status_code == 404
     assert empty_api_client.get(f"{MANIFESTS}/{'A' * 80}").status_code == 422
-    assert empty_api_client.get(f"{MANIFESTS}/..%2F..%2Fetc").status_code in (404, 422)
+    # an encoded slash decodes into extra path segments, so no route matches: 404 (not 422)
+    assert empty_api_client.get(f"{MANIFESTS}/..%2F..%2Fetc").status_code == 404
 
 
 def test_manifest_paths_are_relative(api_client, api_settings):
@@ -213,6 +302,17 @@ def test_manifest_paths_are_relative(api_client, api_settings):
     assert body["note"] == "plain text, not a path"
     text = api_client.get(f"{MANIFESTS}/DS-starter-1-abcd1234").text
     assert str(data) not in text and "someone" not in text and "/var/lib" not in text
+
+
+def test_relativise_paths_only_rewrites_path_leading_strings(tmp_path):
+    """Documented limit: a string is rewritten only when it STARTS with an absolute path;
+    paths embedded in prose and dictionary keys are left alone (the pipeline stores relative
+    paths, so this is defence in depth, not a scrubber)."""
+    prose = "see C:\\Users\\x\\file.csv for details"
+    key = "C:\\keys\\are\\not\\rewritten"
+    out = relativise_paths({key: prose, "lead": str(tmp_path / "generated" / "a.csv")}, tmp_path)
+    assert out[key] == prose
+    assert out["lead"] == "generated/a.csv"
 
 
 def test_real_manifest_exposes_no_filesystem_paths(api_client, api_settings):
@@ -291,9 +391,35 @@ def test_reports_are_404_on_an_empty_database(empty_api_client):
         assert r.json()["error"]["code"] == "not_found"
 
 
-def test_reports_write_nothing(api_client, api_settings):
-    api_client.get("/api/v1/reports/summary")
-    assert not Path(api_settings.reports_dir).exists()
+def _tree(root: Path) -> dict[str, str]:
+    if not root.exists():
+        return {}
+    return {
+        p.relative_to(root).as_posix(): hashlib.sha256(p.read_bytes()).hexdigest()
+        for p in sorted(root.rglob("*"))
+        if p.is_file()
+    }
+
+
+def _row_counts(client: TestClient) -> dict[str, int]:
+    with client.app.state.session_factory() as s:
+        return {
+            t.name: s.scalar(sa.select(sa.func.count()).select_from(t))
+            for t in Base.metadata.sorted_tables
+        }
+
+
+def test_reports_and_evaluation_write_nothing(evaluated_client, api_settings):
+    data, reports = Path(api_settings.data_dir), Path(api_settings.reports_dir)
+    files_before = (_tree(data), _tree(reports))
+    rows_before = _row_counts(evaluated_client)
+    assert files_before[0]  # ground truth and exports are really there
+    for name in ("summary", "supplier-rankings", "data-quality", "anomaly-evaluation"):
+        assert evaluated_client.get(f"/api/v1/reports/{name}").status_code == 200, name
+    assert evaluated_client.post("/api/v1/evaluation/run").status_code == 200
+    assert (_tree(data), _tree(reports)) == files_before
+    assert not reports.exists()
+    assert _row_counts(evaluated_client) == rows_before
 
 
 def test_anomaly_evaluation_404_before_run(empty_api_client, api_client):
