@@ -48,14 +48,32 @@ def test_ready_503_when_db_unreachable(tmp_path, config_path):
     assert "no/such" not in r.text and "sqlite" not in r.text.lower()
 
 
+def test_unusable_url_logs_only_the_exception_type(config_path, capsys):
+    secret = "p4ssw0rd-in-url"
+    create_app(Settings(database_url=f"{secret} not a url", config_path=config_path))
+    logged = capsys.readouterr().err
+    assert "ArgumentError" in logged and secret not in logged
+
+
 def test_ready_503_when_url_cannot_even_be_parsed(config_path):
     bad = Settings(database_url="not a url at all", config_path=config_path)
     r = TestClient(create_app(bad)).get("/ready")
     assert r.status_code == 503 and r.json()["database"] == "unavailable"
 
 
-def test_ready_503_when_not_migrated(client):
-    r = client.get("/ready")  # root fixture: empty, never-migrated SQLite file
+def test_ready_does_not_create_a_missing_sqlite_file(tmp_path, config_path):
+    db = tmp_path / "absent.db"
+    bad = Settings(database_url=f"sqlite:///{db}", config_path=config_path)
+    r = TestClient(create_app(bad)).get("/ready")
+    assert r.status_code == 503
+    assert r.json() == {"status": "not_ready", "database": "unavailable"}
+    assert not db.exists()
+
+
+def test_ready_503_when_not_migrated(client, tmp_settings):
+    # an existing but empty (never migrated) SQLite file
+    Path(tmp_settings.database_url.removeprefix("sqlite:///")).write_bytes(b"")
+    r = client.get("/ready")
     assert r.status_code == 503
     assert r.json() == {"status": "not_ready", "database": "not_migrated"}
 
@@ -324,3 +342,16 @@ def test_list_endpoints_document_examples(api_client):
 def test_no_filesystem_paths_in_list_responses(api_client, path):
     text = api_client.get(path, params={"limit": 50}).text
     assert str(Path.home()) not in text and ":\\\\" not in text
+
+
+def test_openapi_exposes_the_configured_limit_maximum(tmp_settings):
+    app = create_app(tmp_settings.model_copy(update={"max_page_size": 123}))
+    spec = TestClient(app).get("/openapi.json").json()
+    seen = 0
+    for path, item in spec["paths"].items():
+        for op in item.values():
+            for p in op.get("parameters", []):
+                if p["name"] == "limit":
+                    seen += 1
+                    assert p["schema"]["maximum"] == 123, path
+    assert seen >= 5

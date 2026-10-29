@@ -17,8 +17,10 @@ def _utc_z(value: datetime) -> str:
     return value.astimezone(UTC).isoformat().replace("+00:00", "Z")
 
 
-# Decimal money/quantities travel as strings ("1234.50"); floats never carry money.
-Money = Annotated[Decimal, PlainSerializer(_money, return_type=str, when_used="json")]
+# Decimals travel as fixed two-decimal strings ("1234.50"); floats never carry money.
+Decimal2 = Annotated[Decimal, PlainSerializer(_money, return_type=str, when_used="json")]
+Money = Decimal2  # amounts and prices
+Quantity = Decimal2  # quantities, capacities and durations in hours
 # Timestamps are ISO-8601 UTC with a trailing Z.
 UtcDatetime = Annotated[datetime, PlainSerializer(_utc_z, return_type=str, when_used="json")]
 

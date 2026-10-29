@@ -16,7 +16,7 @@ from supplier_reliability.domain.enums import (
     SupplierCategory,
     SupplierStatus,
 )
-from supplier_reliability.schemas.common import Money, OrmModel, UtcDatetime
+from supplier_reliability.schemas.common import OrmModel, Quantity, UtcDatetime
 
 # Scores are 0-100 with two decimals; they are not money, so they travel as JSON numbers.
 Score = float | None
@@ -101,7 +101,7 @@ class ContractOut(OrmModel):
     currency: str
     payment_terms: str
     delivery_terms: str
-    contracted_capacity: Money | None
+    contracted_capacity: Quantity | None
     capacity_unit: str
 
 
@@ -166,5 +166,4 @@ class ExplanationOut(OrmModel):
     overall_score: Score
     reliability_category: ReliabilityCategory
     decision: Decision
-    components: dict[str, Any]
     explanation: dict[str, Any]

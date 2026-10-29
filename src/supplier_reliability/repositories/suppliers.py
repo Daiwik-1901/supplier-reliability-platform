@@ -107,11 +107,7 @@ def get_supplier(session: Session, supplier_id: str) -> Supplier | None:
         .where(Supplier.supplier_id == supplier_id)
         .options(selectinload(Supplier.sites), selectinload(Supplier.contracts))
     )
-    supplier = session.scalars(stmt).first()
-    if supplier is not None:
-        supplier.sites.sort(key=lambda s: s.site_id)
-        supplier.contracts.sort(key=lambda c: c.contract_id)
-    return supplier
+    return session.scalars(stmt).first()
 
 
 def supplier_exists(session: Session, supplier_id: str) -> bool:

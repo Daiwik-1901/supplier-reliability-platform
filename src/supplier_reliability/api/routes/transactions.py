@@ -1,6 +1,6 @@
 """Purchase-order and shipment endpoints."""
 
-from datetime import date
+from datetime import date, datetime
 from typing import Annotated
 
 from fastapi import APIRouter, Depends, Query
@@ -9,12 +9,16 @@ from pydantic import AwareDatetime
 from supplier_reliability.api.dependencies import (
     AppConfigDep,
     DbDep,
+    IdPath,
     PageParams,
     Sort,
     sort_dependency,
 )
 from supplier_reliability.api.errors import NotFoundError, error_responses
+from supplier_reliability.config import AppConfig
 from supplier_reliability.domain.enums import POStatus, ShipmentStatus
+from supplier_reliability.domain.numeric import ensure_utc
+from supplier_reliability.models import Shipment
 from supplier_reliability.repositories import transactions as repo
 from supplier_reliability.schemas.common import Page
 from supplier_reliability.schemas.transactions import (
@@ -75,7 +79,7 @@ def list_purchase_orders(
     description="Purchase order with its lines and shipments.",
     responses=error_responses(404, 422),
 )
-def get_purchase_order(po_id: str, db: DbDep) -> PurchaseOrderDetail:
+def get_purchase_order(po_id: IdPath, db: DbDep) -> PurchaseOrderDetail:
     po = repo.get_purchase_order(db, po_id)
     if po is None:
         raise NotFoundError("Purchase order", po_id)
@@ -86,11 +90,14 @@ def get_purchase_order(po_id: str, db: DbDep) -> PurchaseOrderDetail:
     "/shipments",
     response_model=Page[ShipmentSummary],
     summary="List shipments",
-    description="Paginated shipments. `late_only=true` keeps shipments whose "
+    description="Paginated shipments. A shipment is late (`is_late`) when it arrived and "
     "`actual_delivery_timestamp` is later than `expected_delivery_timestamp` plus the configured "
-    "grace period; `false` keeps the rest. This is a current-state view of the shipment row (its "
-    "corrected arrival), so a shipment without an arrival is never late; scoring uses "
-    f"cutoff-aware evidence instead. Datetime filters: {AWARE_NOTE}",
+    "grace period, or when it has not arrived, is not CANCELLED and expected plus grace is "
+    "before the end of the synthetic reference period (overdue; the wall clock is never used). "
+    "`delay_hours` is actual minus expected (arrived) or reference end minus expected "
+    "(overdue), null when not late. `late_only=true` keeps late shipments, `false` the exact "
+    "complement. This is a current-state view of the shipment row; scoring uses cutoff-aware "
+    f"evidence instead. Datetime filters: {AWARE_NOTE}",
     responses=error_responses(422),
 )
 def list_shipments(
@@ -117,17 +124,31 @@ def list_shipments(
         dispatch_from=dispatch_from,
         dispatch_to=dispatch_to,
         grace_hours=config.scoring.grace_hours,
+        reference_end=_reference_end(config),
     )
     rows, total = repo.list_shipments(
         db, filters, sort.field, sort.descending, page.limit, page.offset
     )
-    items = [_summary(shipment, supplier) for shipment, supplier in rows]
+    grace, ref_end = config.scoring.grace_hours, _reference_end(config)
+    items = [_summary(shipment, supplier, grace, ref_end) for shipment, supplier in rows]
     return Page[ShipmentSummary](items=items, total=total, limit=page.limit, offset=page.offset)
 
 
-def _summary(shipment, supplier_id: str) -> ShipmentSummary:
-    base = ShipmentBase.model_validate(shipment)
-    return ShipmentSummary(**dict(base), supplier_id=supplier_id)
+def _reference_end(config: AppConfig) -> datetime:
+    """Generator reference-period end as aware UTC (from config, never the wall clock)."""
+    return ensure_utc(datetime.fromisoformat(config.generator.reference_period["end"]))
+
+
+def _summary(
+    shipment: Shipment, supplier_id: str, grace_hours: int, reference_end: datetime
+) -> ShipmentSummary:
+    is_late, delay_hours = repo.lateness(shipment, grace_hours, reference_end)
+    return ShipmentSummary(
+        **dict(ShipmentBase.model_validate(shipment)),
+        supplier_id=supplier_id,
+        is_late=is_late,
+        delay_hours=delay_hours,
+    )
 
 
 @router.get(
@@ -137,14 +158,14 @@ def _summary(shipment, supplier_id: str) -> ShipmentSummary:
     description="Shipment with its PO-line allocations.",
     responses=error_responses(404, 422),
 )
-def get_shipment(shipment_id: str, db: DbDep) -> ShipmentDetail:
+def get_shipment(shipment_id: IdPath, db: DbDep, config: AppConfigDep) -> ShipmentDetail:
     found = repo.get_shipment(db, shipment_id)
     if found is None:
         raise NotFoundError("Shipment", shipment_id)
     shipment, supplier_id = found
+    summary = _summary(shipment, supplier_id, config.scoring.grace_hours, _reference_end(config))
     return ShipmentDetail(
-        **dict(ShipmentBase.model_validate(shipment)),
-        supplier_id=supplier_id,
+        **dict(summary),
         lines=[ShipmentLineOut.model_validate(line) for line in shipment.lines],
     )
 
@@ -157,7 +178,7 @@ def get_shipment(shipment_id: str, db: DbDep) -> ShipmentDetail:
     "`recorded_timestamp` shows when each event became known.",
     responses=error_responses(404, 422),
 )
-def list_events(shipment_id: str, db: DbDep, page: PageParams) -> Page[DeliveryEventOut]:
+def list_events(shipment_id: IdPath, db: DbDep, page: PageParams) -> Page[DeliveryEventOut]:
     if not repo.shipment_exists(db, shipment_id):
         raise NotFoundError("Shipment", shipment_id)
     rows, total = repo.list_shipment_events(db, shipment_id, page.limit, page.offset)

@@ -44,8 +44,12 @@ class Supplier(Base):
     updated_at: Mapped[datetime] = mapped_column(UTCDateTime)
 
     # Relationships default to lazy="raise" (R7): load explicitly with selectinload/joins.
-    sites: Mapped[list["Site"]] = relationship(back_populates="supplier", lazy="raise")
-    contracts: Mapped[list["Contract"]] = relationship(back_populates="supplier", lazy="raise")
+    sites: Mapped[list["Site"]] = relationship(
+        back_populates="supplier", lazy="raise", order_by="Site.site_id"
+    )
+    contracts: Mapped[list["Contract"]] = relationship(
+        back_populates="supplier", lazy="raise", order_by="Contract.contract_id"
+    )
     certifications: Mapped[list["SupplierCertification"]] = relationship(
         back_populates="supplier", lazy="raise"
     )

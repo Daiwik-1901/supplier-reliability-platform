@@ -4,7 +4,7 @@ from typing import Annotated
 
 from fastapi import APIRouter, Depends, Query
 
-from supplier_reliability.api.dependencies import DbDep, PageParams, Sort, sort_dependency
+from supplier_reliability.api.dependencies import DbDep, IdPath, PageParams, Sort, sort_dependency
 from supplier_reliability.api.errors import NotFoundError, error_responses
 from supplier_reliability.domain.enums import (
     Region,
@@ -32,7 +32,7 @@ SupplierSort = Annotated[
 ]
 
 
-def _require_supplier(db: DbDep, supplier_id: str) -> None:
+def _require_supplier(db: DbDep, supplier_id: IdPath) -> None:
     if not repo.supplier_exists(db, supplier_id):
         raise NotFoundError("Supplier", supplier_id)
 
@@ -84,7 +84,7 @@ def _brief(score: SupplierScore | None) -> ScoreBrief | None:
     description="Supplier with its sites, contracts and latest current score.",
     responses=error_responses(404, 422),
 )
-def get_supplier(supplier_id: str, db: DbDep) -> SupplierDetail:
+def get_supplier(supplier_id: IdPath, db: DbDep) -> SupplierDetail:
     supplier = repo.get_supplier(db, supplier_id)
     if supplier is None:
         raise NotFoundError("Supplier", supplier_id)
@@ -102,7 +102,7 @@ def get_supplier(supplier_id: str, db: DbDep) -> SupplierDetail:
     "window. A component without enough evidence is null; `missing_reasons` says why.",
     responses=error_responses(404, 422),
 )
-def get_performance(supplier_id: str, db: DbDep) -> PerformanceOut:
+def get_performance(supplier_id: IdPath, db: DbDep) -> PerformanceOut:
     _require_supplier(db, supplier_id)
     windows = []
     for score in repo.current_scores(db, supplier_id):
@@ -121,7 +121,7 @@ def get_performance(supplier_id: str, db: DbDep) -> PerformanceOut:
     "and version number.",
     responses=error_responses(404, 422),
 )
-def get_score_history(supplier_id: str, db: DbDep, page: PageParams) -> Page[ScoreVersionOut]:
+def get_score_history(supplier_id: IdPath, db: DbDep, page: PageParams) -> Page[ScoreVersionOut]:
     _require_supplier(db, supplier_id)
     rows, total = repo.score_history(db, supplier_id, page.limit, page.offset)
     items = [ScoreVersionOut.model_validate(r) for r in rows]
@@ -137,7 +137,7 @@ def get_score_history(supplier_id: str, db: DbDep, page: PageParams) -> Page[Sco
     "404 if the supplier has no score yet.",
     responses=error_responses(404, 422),
 )
-def get_explanation(supplier_id: str, db: DbDep) -> ExplanationOut:
+def get_explanation(supplier_id: IdPath, db: DbDep) -> ExplanationOut:
     _require_supplier(db, supplier_id)
     score = repo.latest_current_score(db, supplier_id)
     if score is None:
@@ -151,6 +151,5 @@ def get_explanation(supplier_id: str, db: DbDep) -> ExplanationOut:
         overall_score=score.overall_score,
         reliability_category=score.reliability_category,
         decision=score.decision,
-        components=score.explanation.get("components", {}),
         explanation=score.explanation,
     )

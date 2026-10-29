@@ -4,7 +4,7 @@ from datetime import date
 from typing import Any
 
 from supplier_reliability.domain.enums import DeliveryEventType, POStatus, ShipmentStatus
-from supplier_reliability.schemas.common import Money, OrmModel, UtcDatetime
+from supplier_reliability.schemas.common import Money, OrmModel, Quantity, UtcDatetime
 
 
 class PurchaseOrderSummary(OrmModel):
@@ -23,7 +23,7 @@ class POLineOut(OrmModel):
     po_id: str
     line_number: int
     product_category: str
-    ordered_quantity: Money
+    ordered_quantity: Quantity
     unit_of_measure: str
     agreed_unit_price: Money
     line_amount: Money
@@ -39,21 +39,23 @@ class ShipmentBase(OrmModel):
     expected_delivery_timestamp: UtcDatetime
     actual_delivery_timestamp: UtcDatetime | None
     shipment_status: ShipmentStatus
-    shipped_quantity: Money
-    received_quantity: Money
+    shipped_quantity: Quantity
+    received_quantity: Quantity
 
 
 class ShipmentSummary(ShipmentBase):
     supplier_id: str
+    is_late: bool
+    delay_hours: Quantity | None  # hours late when is_late, else null
 
 
 class ShipmentLineOut(OrmModel):
     shipment_line_id: str
     po_line_id: str
     unit_of_measure: str
-    allocated_quantity: Money
-    shipped_quantity: Money
-    received_quantity: Money
+    allocated_quantity: Quantity
+    shipped_quantity: Quantity
+    received_quantity: Quantity
     received_at: UtcDatetime | None
 
 

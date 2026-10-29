@@ -4,13 +4,20 @@ from collections.abc import Callable, Iterator, Sequence
 from dataclasses import dataclass
 from typing import Annotated
 
-from fastapi import Depends, Query, Request
+from fastapi import Depends, Path, Query, Request
 from sqlalchemy.orm import Session
 
 from supplier_reliability.api.errors import InvalidRequestError
 from supplier_reliability.config import AppConfig, Settings, load_app_config
 
 DEFAULT_PAGE_SIZE = 50
+
+# Path ids (SUP-000001, PO-2026-000001, SHP-2026-000001, SCORE-...): bounded and
+# restricted to the id alphabet, so odd input is a 422 that never reaches the database.
+IdPath = Annotated[
+    str,
+    Path(pattern=r"^[A-Z0-9-]{1,40}$", max_length=40, examples=["SUP-000001"]),
+]
 
 
 def get_settings(request: Request) -> Settings:

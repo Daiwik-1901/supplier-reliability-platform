@@ -2,12 +2,14 @@
 
 import logging
 from functools import lru_cache
+from pathlib import Path
 
 import sqlalchemy as sa
 from alembic.runtime.migration import MigrationContext
 from alembic.script import ScriptDirectory
 from fastapi import APIRouter, Request
 from fastapi.responses import JSONResponse
+from sqlalchemy.engine import make_url
 
 from supplier_reliability import GENERATOR_VERSION, SCHEMA_VERSION, __version__
 from supplier_reliability.api.dependencies import AppConfigDep, DbDep
@@ -25,6 +27,18 @@ router = APIRouter(tags=["health"])
 @lru_cache
 def _head_revision() -> str:
     return ScriptDirectory.from_config(alembic_config("sqlite://")).get_current_head() or ""
+
+
+def _missing_sqlite_file(url: str) -> bool:
+    """True for a file-based SQLite URL whose file does not exist: connecting would
+    silently create an empty database, so readiness must not try."""
+    parsed = make_url(url)
+    if parsed.get_backend_name() != "sqlite":
+        return False
+    database = parsed.database
+    if not database or database == ":memory:" or database.startswith("file:"):
+        return False
+    return not Path(database).exists()
 
 
 def _not_ready(database: str) -> JSONResponse:
@@ -56,7 +70,7 @@ def health() -> HealthOut:
 )
 def ready(request: Request) -> ReadyOut | JSONResponse:
     engine = request.app.state.engine
-    if engine is None:
+    if engine is None or _missing_sqlite_file(request.app.state.settings.database_url):
         return _not_ready("unavailable")
     try:
         with engine.connect() as conn:

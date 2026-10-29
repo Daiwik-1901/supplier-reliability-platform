@@ -1,7 +1,8 @@
 """Purchase-order and shipment read queries (set-based; details use selectinload)."""
 
 from dataclasses import dataclass
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
+from decimal import ROUND_HALF_UP, Decimal
 
 import sqlalchemy as sa
 from sqlalchemy.orm import Session, selectinload
@@ -30,6 +31,8 @@ class ShipmentFilters:
     dispatch_from: datetime | None = None
     dispatch_to: datetime | None = None
     grace_hours: int = 24
+    # generator reference-period end (aware UTC, from config, never the wall clock)
+    reference_end: datetime | None = None
 
 
 def _ordering(column, descending: bool, tiebreak):
@@ -82,16 +85,53 @@ def get_purchase_order(session: Session, po_id: str) -> PurchaseOrder | None:
     return po
 
 
-def _seconds_between(session: Session, later, earlier):
-    """Whole seconds from `earlier` to `later` as an integer expression (exact at boundaries)."""
-    dialect = session.get_bind().dialect.name
-    if dialect == "sqlite":
-        return sa.cast(sa.func.strftime("%s", later), sa.Integer) - sa.cast(
-            sa.func.strftime("%s", earlier), sa.Integer
-        )
-    if dialect == "postgresql":
-        return sa.func.extract("epoch", later - earlier)
-    raise NotImplementedError(f"late_only is not implemented for {dialect}")
+def lateness(
+    shipment: Shipment, grace_hours: int, reference_end: datetime
+) -> tuple[bool, Decimal | None]:
+    """(is_late, delay_hours) by the R48 rule; the SQL predicate in `_is_late` is the same.
+
+    Arrived: late iff actual > expected + grace, delay = actual - expected. Not arrived and
+    not CANCELLED: late iff expected + grace < reference_end (overdue), delay = reference_end -
+    expected. Otherwise on time / not due / cancelled: (False, None). Hours have 2 dp."""
+    grace = timedelta(hours=grace_hours)
+    expected, actual = shipment.expected_delivery_timestamp, shipment.actual_delivery_timestamp
+    if actual is not None:
+        late, delay = actual > expected + grace, actual - expected
+    else:
+        cancelled = shipment.shipment_status == ShipmentStatus.CANCELLED
+        late, delay = (not cancelled and expected + grace < reference_end), reference_end - expected
+    if not late:
+        return False, None
+    hours = Decimal(delay.total_seconds()) / Decimal(3600)
+    return True, hours.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+
+
+def _is_late(session: Session, filters: ShipmentFilters) -> sa.ColumnElement[bool]:
+    """SQL form of `lateness`. Never NULL, so NOT(...) is the exact complement.
+
+    The arrived branch compares two columns. SQLite cannot add an interval to a column, so
+    there the difference is taken in whole epoch seconds (sub-second parts are truncated; the
+    generator emits whole seconds). PostgreSQL adds an interval, which keeps full precision
+    (PostgreSQL behaviour UNVERIFIED: no PostgreSQL available). The overdue branch compares
+    the column with a bound parameter on both dialects."""
+    sh = Shipment
+    if filters.reference_end is None:
+        raise ValueError("late_only needs reference_end")
+    grace = timedelta(hours=filters.grace_hours)
+    if session.get_bind().dialect.name == "sqlite":
+        seconds = sa.cast(
+            sa.func.strftime("%s", sh.actual_delivery_timestamp), sa.Integer
+        ) - sa.cast(sa.func.strftime("%s", sh.expected_delivery_timestamp), sa.Integer)
+        arrived_late = seconds > int(grace.total_seconds())
+    else:
+        arrived_late = sh.actual_delivery_timestamp > sh.expected_delivery_timestamp + grace
+    arrived = sa.and_(sh.actual_delivery_timestamp.is_not(None), arrived_late)
+    overdue = sa.and_(
+        sh.actual_delivery_timestamp.is_(None),
+        sh.shipment_status != ShipmentStatus.CANCELLED,
+        sh.expected_delivery_timestamp < filters.reference_end - grace,
+    )
+    return sa.or_(arrived, overdue)
 
 
 def list_shipments(
@@ -104,9 +144,11 @@ def list_shipments(
 ) -> tuple[list[tuple[Shipment, str]], int]:
     """(page of (shipment, supplier_id), total): the supplier comes from the PO in the same query.
 
-    late_only compares the shipment row's actual_delivery_timestamp (the current, corrected
-    arrival) with expected + grace. A shipment with no recorded arrival is never "late" here:
-    this is a current-state view without a clock, unlike the cutoff-aware scoring evidence."""
+    late_only follows Ruling R48 (see `lateness`): the shipment row's actual_delivery_timestamp
+    (the current, corrected arrival) is compared with expected + grace, and a shipment with no
+    arrival that is not CANCELLED is late once expected + grace < reference_end (the fixed
+    reference-period end, not the wall clock). This is a current-state view, unlike the
+    cutoff-aware scoring evidence. late_only=false is the exact complement."""
     sh, po = Shipment, PurchaseOrder
     conditions: list[sa.ColumnElement[bool]] = []
     if filters.supplier_id is not None:
@@ -120,12 +162,7 @@ def list_shipments(
     if filters.dispatch_to is not None:
         conditions.append(sh.dispatch_timestamp <= filters.dispatch_to)
     if filters.late_only is not None:
-        delay = _seconds_between(
-            session, sh.actual_delivery_timestamp, sh.expected_delivery_timestamp
-        )
-        late = sa.and_(
-            sh.actual_delivery_timestamp.is_not(None), delay > filters.grace_hours * 3600
-        )
+        late = _is_late(session, filters)
         conditions.append(late if filters.late_only else sa.not_(late))
 
     def joined(stmt: sa.Select) -> sa.Select:

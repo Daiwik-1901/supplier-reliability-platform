@@ -45,8 +45,12 @@ class PurchaseOrder(Base):
 
     supplier: Mapped["Supplier"] = relationship(back_populates="purchase_orders", lazy="raise")
     contract: Mapped["Contract"] = relationship(back_populates="purchase_orders", lazy="raise")
-    lines: Mapped[list["POLine"]] = relationship(back_populates="po", lazy="raise")
-    shipments: Mapped[list["Shipment"]] = relationship(back_populates="po", lazy="raise")
+    lines: Mapped[list["POLine"]] = relationship(
+        back_populates="po", lazy="raise", order_by="POLine.line_number"
+    )
+    shipments: Mapped[list["Shipment"]] = relationship(
+        back_populates="po", lazy="raise", order_by="Shipment.shipment_id"
+    )
     invoices: Mapped[list["Invoice"]] = relationship(back_populates="po", lazy="raise")
 
 
@@ -99,7 +103,7 @@ class Shipment(Base):
     po: Mapped["PurchaseOrder"] = relationship(back_populates="shipments", lazy="raise")
     originating_site: Mapped["Site"] = relationship(lazy="raise")
     lines: Mapped[list["ShipmentLineAllocation"]] = relationship(
-        back_populates="shipment", lazy="raise"
+        back_populates="shipment", lazy="raise", order_by="ShipmentLineAllocation.shipment_line_id"
     )
     events: Mapped[list["DeliveryEvent"]] = relationship(back_populates="shipment", lazy="raise")
     invoices: Mapped[list["Invoice"]] = relationship(back_populates="shipment", lazy="raise")

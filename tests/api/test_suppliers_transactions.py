@@ -13,6 +13,7 @@ from sqlalchemy import event
 from supplier_reliability.domain.enums import (
     Region,
     ReliabilityCategory,
+    ShipmentStatus,
     SupplierCategory,
     SupplierStatus,
 )
@@ -315,7 +316,8 @@ def test_supplier_explanation_has_components_and_cutoff(api_client):
     r = api_client.get("/api/v1/suppliers/SUP-000001/explanation")
     assert r.status_code == 200
     body = r.json()
-    assert set(body["components"]) == {
+    assert "components" not in body  # lives once, inside `explanation`
+    assert set(body["explanation"]["components"]) == {
         "delivery",
         "quality",
         "cost",
@@ -482,34 +484,76 @@ def _parse(value):
     return None if value is None else datetime.fromisoformat(value.replace("Z", "+00:00"))
 
 
-def test_late_only_uses_arrival_vs_expected_plus_grace(api_client, app_config):
+def _reference_end(app_config):
+    return _parse(app_config.generator.reference_period["end"])
+
+
+def _expected_late(item, grace, ref_end):
+    """The R48 rule, restated independently from the response fields."""
+    actual = _parse(item["actual_delivery_timestamp"])
+    expected = _parse(item["expected_delivery_timestamp"])
+    if actual is not None:
+        return actual > expected + grace
+    return item["shipment_status"] != "CANCELLED" and expected + grace < ref_end
+
+
+def test_late_only_follows_r48_for_every_shipment(api_client, app_config):
     grace = timedelta(hours=app_config.scoring.grace_hours)
+    ref_end = _reference_end(app_config)
     items = all_pages(api_client, "/api/v1/shipments")
     assert len(items) == 450
-    want = sorted(
-        i["shipment_id"]
-        for i in items
-        if _parse(i["actual_delivery_timestamp"]) is not None
-        and _parse(i["actual_delivery_timestamp"])
-        > _parse(i["expected_delivery_timestamp"]) + grace
-    )
-    got = sorted(
-        i["shipment_id"] for i in all_pages(api_client, "/api/v1/shipments", late_only=True)
-    )
-    assert got == want and 0 < len(want) < 450
-    rest = {i["shipment_id"] for i in all_pages(api_client, "/api/v1/shipments", late_only=False)}
-    assert rest.isdisjoint(want) and len(rest) == 450 - len(want)
+    want = sorted(i["shipment_id"] for i in items if _expected_late(i, grace, ref_end))
+    late = all_pages(api_client, "/api/v1/shipments", late_only=True)
+    rest = all_pages(api_client, "/api/v1/shipments", late_only=False)
+    assert sorted(i["shipment_id"] for i in late) == want and 0 < len(want) < 450
+    # late + not-late partitions the table: false never silently drops NULL-arrival rows
+    assert len(late) + len(rest) == 450
+    assert {i["shipment_id"] for i in rest}.isdisjoint(want)
+    late_ids = set(want)
+    for i in items:
+        assert i["is_late"] is (i["shipment_id"] in late_ids)
+        assert (i["delay_hours"] is not None) is i["is_late"]
 
 
-def test_late_only_boundary_exactly_at_grace_is_on_time(api_client):
+def test_late_only_cases_arrived_overdue_cancelled_and_boundary(api_client, app_config):
+    grace_h = app_config.scoring.grace_hours
+    ref_end = _reference_end(app_config)
     with session(api_client) as s:
-        a, b = s.scalars(sa.select(Shipment).order_by(Shipment.shipment_id).limit(2)).all()
-        a.actual_delivery_timestamp = a.expected_delivery_timestamp + timedelta(hours=24)
-        b.actual_delivery_timestamp = b.expected_delivery_timestamp + timedelta(hours=24, seconds=1)
-        a_id, b_id = a.shipment_id, b.shipment_id
+        ships = s.scalars(sa.select(Shipment).order_by(Shipment.shipment_id).limit(6)).all()
+        arrived_late, at_boundary, overdue, cancelled, not_due, arrived_early = ships
+        arrived_late.actual_delivery_timestamp = arrived_late.expected_delivery_timestamp + (
+            timedelta(hours=grace_h, seconds=1)
+        )
+        at_boundary.actual_delivery_timestamp = at_boundary.expected_delivery_timestamp + (
+            timedelta(hours=grace_h)
+        )
+        overdue.actual_delivery_timestamp = None
+        overdue.expected_delivery_timestamp = ref_end - timedelta(days=10)
+        overdue.shipment_status = ShipmentStatus.IN_TRANSIT
+        cancelled.actual_delivery_timestamp = None
+        cancelled.expected_delivery_timestamp = ref_end - timedelta(days=10)
+        cancelled.shipment_status = ShipmentStatus.CANCELLED
+        not_due.actual_delivery_timestamp = None
+        not_due.expected_delivery_timestamp = ref_end - timedelta(hours=grace_h - 1)
+        not_due.shipment_status = ShipmentStatus.IN_TRANSIT
+        arrived_early.actual_delivery_timestamp = arrived_early.expected_delivery_timestamp - (
+            timedelta(hours=5)
+        )
+        ids = [x.shipment_id for x in ships]
+        overdue_expected = overdue.expected_delivery_timestamp
         s.commit()
     late = {i["shipment_id"] for i in all_pages(api_client, "/api/v1/shipments", late_only=True)}
-    assert a_id not in late and b_id in late
+    a, b, o, c, n, e = ids
+    assert a in late and o in late
+    assert not ({b, c, n, e} & late)  # boundary, CANCELLED, not yet due, early arrival
+    by_id = {i["shipment_id"]: i for i in all_pages(api_client, "/api/v1/shipments")}
+    assert by_id[a]["is_late"] and by_id[a]["delay_hours"] == f"{grace_h:.2f}"
+    overdue_hours = (ref_end - overdue_expected).total_seconds() / 3600
+    assert by_id[o]["is_late"] and by_id[o]["delay_hours"] == f"{overdue_hours:.2f}"
+    for sid in (b, c, n, e):
+        assert by_id[sid]["is_late"] is False and by_id[sid]["delay_hours"] is None
+    detail = api_client.get(f"/api/v1/shipments/{o}").json()
+    assert detail["is_late"] is True and detail["delay_hours"] == f"{overdue_hours:.2f}"
 
 
 def test_shipment_detail_has_lines_and_supplier(api_client):
@@ -583,17 +627,65 @@ def test_supplier_list_statement_count_is_constant(api_client):
     assert n5 == n50 and n50 <= 3  # one count + one page (scores joined in the same query)
 
 
+def _extremes(client, sql):
+    """(id with the most child rows, id with the fewest) from independent SQL."""
+    with session(client) as s:
+        rows = s.execute(sa.text(sql)).all()
+    rows.sort(key=lambda r: (r[1], r[0]))
+    assert rows[-1][1] > rows[0][1]  # differing collection sizes, or the test proves nothing
+    return rows[-1][0], rows[0][0]
+
+
 def test_detail_and_transaction_lists_have_constant_statement_counts(api_client):
     for url in ("/api/v1/shipments", "/api/v1/purchase-orders"):
         n5, _ = count_statements(api_client, url, limit=5)
         n50, _ = count_statements(api_client, url, limit=50)
         assert n5 == n50 <= 3
-    n_a, _ = count_statements(api_client, "/api/v1/suppliers/SUP-000001")
-    n_b, _ = count_statements(api_client, "/api/v1/suppliers/SUP-000002")
-    assert n_a == n_b <= 5
-    n_a, _ = count_statements(api_client, "/api/v1/purchase-orders/PO-2026-000001")
-    n_b, _ = count_statements(api_client, "/api/v1/purchase-orders/PO-2026-000002")
-    assert n_a == n_b <= 5
+    big, small = _extremes(
+        api_client,
+        "SELECT s.supplier_id, COUNT(DISTINCT c.contract_id) + COUNT(DISTINCT x.site_id) "
+        "FROM suppliers s LEFT JOIN contracts c ON c.supplier_id = s.supplier_id "
+        "LEFT JOIN sites x ON x.supplier_id = s.supplier_id GROUP BY s.supplier_id",
+    )
+    n_big, _ = count_statements(api_client, f"/api/v1/suppliers/{big}")
+    n_small, _ = count_statements(api_client, f"/api/v1/suppliers/{small}")
+    assert n_big == n_small <= 5
+    big, small = _extremes(api_client, "SELECT po_id, COUNT(*) FROM po_lines GROUP BY po_id")
+    n_big, _ = count_statements(api_client, f"/api/v1/purchase-orders/{big}")
+    n_small, _ = count_statements(api_client, f"/api/v1/purchase-orders/{small}")
+    assert n_big == n_small <= 5
+    big, small = _extremes(
+        api_client, "SELECT shipment_id, COUNT(*) FROM shipment_lines GROUP BY shipment_id"
+    )
+    n_big, _ = count_statements(api_client, f"/api/v1/shipments/{big}")
+    n_small, _ = count_statements(api_client, f"/api/v1/shipments/{small}")
+    assert n_big == n_small <= 3
+    big, small = _extremes(
+        api_client, "SELECT shipment_id, COUNT(*) FROM delivery_events GROUP BY shipment_id"
+    )
+    n_big, _ = count_statements(api_client, f"/api/v1/shipments/{big}/events")
+    n_small, _ = count_statements(api_client, f"/api/v1/shipments/{small}/events")
+    assert n_big == n_small
+
+
+@pytest.mark.parametrize(
+    "path",
+    [
+        "/api/v1/suppliers/{}",
+        "/api/v1/suppliers/{}/performance",
+        "/api/v1/suppliers/{}/scores",
+        "/api/v1/suppliers/{}/explanation",
+        "/api/v1/purchase-orders/{}",
+        "/api/v1/shipments/{}",
+        "/api/v1/shipments/{}/events",
+    ],
+)
+@pytest.mark.parametrize("bad_id", ["X" * 60, "sup-000001", "SUP_000001", "SUP.1%3Bdrop"])
+def test_malformed_path_ids_are_422_without_echo(api_client, path, bad_id):
+    r = api_client.get(path.format(bad_id))
+    assert r.status_code == 422
+    assert r.json()["error"]["code"] == "validation_error"
+    assert bad_id not in r.text and "drop" not in r.text
 
 
 def test_reliability_category_values_listed_in_openapi(api_client):
