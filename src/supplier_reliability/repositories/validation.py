@@ -7,6 +7,7 @@ from typing import Any
 import sqlalchemy as sa
 from sqlalchemy.orm import Session
 
+from supplier_reliability.domain.enums import Severity
 from supplier_reliability.models import DataException, ValidationFinding, ValidationRun
 
 RUN_ID_PREFIX = "VAL-"
@@ -60,3 +61,32 @@ def quarantined_record_ids(session: Session) -> set[str]:
         DataException.source_record_id.is_not(None)
     )
     return set(session.scalars(stmt))
+
+
+def latest_run_id(session: Session) -> str | None:
+    """The most recent run (run ids are zero-padded, so the greatest id is the newest)."""
+    return session.scalar(sa.select(sa.func.max(ValidationRun.run_id)))
+
+
+def run_exists(session: Session, run_id: str) -> bool:
+    return session.get(ValidationRun, run_id) is not None
+
+
+def list_findings(
+    session: Session,
+    run_id: str,
+    severity: Severity | None,
+    rule_id: str | None,
+    limit: int,
+    offset: int,
+) -> tuple[list[ValidationFinding], int]:
+    """(one page of a run's findings ordered by finding_id, total matching)."""
+    f = ValidationFinding
+    conditions = [f.run_id == run_id]
+    if severity is not None:
+        conditions.append(f.severity == severity)
+    if rule_id is not None:
+        conditions.append(f.rule_id == rule_id)
+    total = session.scalar(sa.select(sa.func.count()).select_from(f).where(*conditions))
+    stmt = sa.select(f).where(*conditions).order_by(f.finding_id).limit(limit).offset(offset)
+    return list(session.scalars(stmt)), int(total or 0)

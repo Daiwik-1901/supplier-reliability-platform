@@ -149,3 +149,12 @@ def score_history(
         .offset(offset)
     )
     return list(session.scalars(stmt)), int(total or 0)
+
+
+def existing_supplier_ids(session: Session, ids: Sequence[str]) -> set[str]:
+    """The subset of `ids` that are supplier ids (one query)."""
+    if not ids:
+        return set()
+    return set(
+        session.scalars(sa.select(Supplier.supplier_id).where(Supplier.supplier_id.in_(ids)))
+    )

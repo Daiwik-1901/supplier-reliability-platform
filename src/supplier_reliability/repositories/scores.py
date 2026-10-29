@@ -9,7 +9,7 @@ import sqlalchemy as sa
 from sqlalchemy.orm import Session
 
 from supplier_reliability.domain.enums import CalculationStatus, ReliabilityCategory
-from supplier_reliability.models import SupplierScore
+from supplier_reliability.models import ScoreEvidence, SupplierScore
 
 # sort keys accepted by list_scores ("-" prefix = descending); anything else is rejected
 SORTABLE_COLUMNS = {
@@ -106,3 +106,19 @@ def latest_current_score(session: Session, supplier_id: str) -> SupplierScore | 
         .limit(1)
     )
     return session.scalars(stmt).first()
+
+
+def lineage_counts(session: Session, score_id: str) -> dict[str, dict[str, int]]:
+    """{component: {"included": n, "excluded": n}} over the score's lineage rows (one query)."""
+    e = ScoreEvidence
+    rows = session.execute(
+        sa.select(e.component, e.included, sa.func.count())
+        .where(e.score_id == score_id)
+        .group_by(e.component, e.included)
+    ).all()
+    out: dict[str, dict[str, int]] = {}
+    for component, included, n in rows:
+        out.setdefault(component.value, {"included": 0, "excluded": 0})[
+            "included" if included else "excluded"
+        ] = n
+    return out

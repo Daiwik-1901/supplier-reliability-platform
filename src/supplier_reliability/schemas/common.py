@@ -4,7 +4,7 @@ from datetime import UTC, datetime
 from decimal import ROUND_HALF_UP, Decimal
 from typing import Annotated, Any
 
-from pydantic import BaseModel, ConfigDict, PlainSerializer
+from pydantic import BaseModel, ConfigDict, PlainSerializer, StringConstraints
 
 
 def _money(value: Decimal) -> str:
@@ -23,6 +23,10 @@ Money = Decimal2  # amounts and prices
 Quantity = Decimal2  # quantities, capacities and durations in hours
 # Timestamps are ISO-8601 UTC with a trailing Z.
 UtcDatetime = Annotated[datetime, PlainSerializer(_utc_z, return_type=str, when_used="json")]
+
+
+# Record ids in request bodies/queries: same alphabet and bound as the IdPath path parameter.
+IdStr = Annotated[str, StringConstraints(pattern=r"^[A-Z0-9-]{1,40}$", max_length=40)]
 
 
 class OrmModel(BaseModel):

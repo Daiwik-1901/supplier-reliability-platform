@@ -8,7 +8,14 @@ from fastapi.middleware.cors import CORSMiddleware
 from supplier_reliability import __version__
 from supplier_reliability.api.errors import register_error_handlers
 from supplier_reliability.api.middleware import RequestSizeLimitMiddleware
-from supplier_reliability.api.routes import health, suppliers, transactions
+from supplier_reliability.api.routes import (
+    exceptions,
+    health,
+    scores,
+    suppliers,
+    transactions,
+    validation,
+)
 from supplier_reliability.config import Settings, get_settings
 from supplier_reliability.database import make_engine, make_session_factory
 from supplier_reliability.logging_config import configure_logging
@@ -74,6 +81,9 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.include_router(health.router)
     app.include_router(suppliers.router)
     app.include_router(transactions.router)
+    app.include_router(scores.router)
+    app.include_router(validation.router)
+    app.include_router(exceptions.router)
     return app
 
 

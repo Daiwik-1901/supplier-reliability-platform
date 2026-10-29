@@ -312,10 +312,12 @@ def test_every_api_route_is_documented(api_client):
         for method, op in item.items()
         if path.startswith("/api/v1") or path in {"/health", "/ready"}
     ]
-    assert len(api_ops) == 13  # 3 system + 5 supplier + 2 PO + 3 shipment routes
+    assert (
+        len(api_ops) == 22
+    )  # 3 system + 5 supplier + 2 PO + 3 shipment + 5 score + 2 validation + 2 exception
     for path, method, op in api_ops:
         assert op.get("summary"), (path, method)
-        ok = op["responses"].get("200")
+        ok = op["responses"].get("200") or op["responses"].get("201")
         assert ok and "schema" in ok["content"]["application/json"], (path, method)
         if "{" in path:
             assert "404" in op["responses"], (path, method)
