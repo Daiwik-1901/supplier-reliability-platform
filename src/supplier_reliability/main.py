@@ -6,11 +6,14 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from supplier_reliability import __version__
+from supplier_reliability.api.dependencies import wall_clock
 from supplier_reliability.api.errors import register_error_handlers
 from supplier_reliability.api.middleware import RequestSizeLimitMiddleware
 from supplier_reliability.api.routes import (
+    datasets,
     exceptions,
     health,
+    reports,
     scores,
     suppliers,
     transactions,
@@ -19,6 +22,7 @@ from supplier_reliability.api.routes import (
 from supplier_reliability.config import Settings, get_settings
 from supplier_reliability.database import make_engine, make_session_factory
 from supplier_reliability.logging_config import configure_logging
+from supplier_reliability.services.jobs import recover_interrupted_jobs
 
 logger = logging.getLogger(__name__)
 
@@ -39,6 +43,17 @@ def _expose_limit_maximum(app: FastAPI, maximum: int) -> None:
     app.openapi = openapi
 
 
+def _recover_jobs(app: FastAPI) -> None:
+    """Jobs left QUEUED/RUNNING by a previous process can never finish (process-local runner)."""
+    factory = app.state.session_factory
+    if factory is None:
+        return
+    try:
+        recover_interrupted_jobs(factory, wall_clock)
+    except Exception as exc:  # noqa: BLE001 - e.g. database not migrated yet; startup must go on
+        logger.warning("job recovery skipped: %s", type(exc).__name__)
+
+
 def create_app(settings: Settings | None = None) -> FastAPI:
     settings = settings or get_settings()
     configure_logging(settings.log_level, settings.log_json)
@@ -51,7 +66,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         engine = None
 
     @asynccontextmanager
-    async def lifespan(_: FastAPI) -> AsyncIterator[None]:
+    async def lifespan(app_: FastAPI) -> AsyncIterator[None]:
+        _recover_jobs(app_)
         yield
         if engine is not None:
             engine.dispose()
@@ -66,6 +82,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.state.settings = settings
     app.state.engine = engine
     app.state.session_factory = make_session_factory(engine) if engine is not None else None
+    app.state.job_stages = {}  # job_id -> last pipeline stage (best effort, lost on restart)
     app.state.app_config = None  # loaded lazily by api.dependencies.get_app_config
 
     _expose_limit_maximum(app, settings.max_page_size)
@@ -84,6 +101,9 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.include_router(scores.router)
     app.include_router(validation.router)
     app.include_router(exceptions.router)
+    app.include_router(datasets.router)
+    app.include_router(reports.router)
+    app.include_router(reports.evaluation_router)
     return app
 
 

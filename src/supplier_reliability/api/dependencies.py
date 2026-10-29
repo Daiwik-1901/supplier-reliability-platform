@@ -5,11 +5,12 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Annotated
 
-from fastapi import Depends, Path, Query, Request
+from fastapi import BackgroundTasks, Depends, Path, Query, Request
 from sqlalchemy.orm import Session
 
 from supplier_reliability.api.errors import InvalidRequestError
 from supplier_reliability.config import AppConfig, Settings, load_app_config
+from supplier_reliability.services.jobs import BackgroundTaskRunner, JobContext, JobRunner
 
 DEFAULT_PAGE_SIZE = 50
 
@@ -49,6 +50,24 @@ def get_app_config(request: Request) -> AppConfig:
     if getattr(state, "app_config", None) is None:
         state.app_config = load_app_config(state.settings.config_path)
     return state.app_config
+
+
+def get_job_runner(background: BackgroundTasks) -> JobRunner:
+    """The process-local background runner; tests override this with an InlineRunner."""
+    return BackgroundTaskRunner(background)
+
+
+def get_job_context(
+    request: Request, config: Annotated[AppConfig, Depends(get_app_config)]
+) -> JobContext:
+    state = request.app.state
+    return JobContext(
+        session_factory=state.session_factory,
+        settings=state.settings,
+        app_config=config,
+        clock=wall_clock,
+        stages=state.job_stages,
+    )
 
 
 SettingsDep = Annotated[Settings, Depends(get_settings)]
