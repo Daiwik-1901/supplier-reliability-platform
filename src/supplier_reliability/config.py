@@ -33,6 +33,7 @@ class Settings(BaseSettings):
     data_dir: Path = Path("data")
     reports_dir: Path = Path("reports")
     max_page_size: int = 500
+    max_request_bytes: int = 1024 * 1024  # request bodies above this get 413
     cors_origins: list[str] = []
 
 
