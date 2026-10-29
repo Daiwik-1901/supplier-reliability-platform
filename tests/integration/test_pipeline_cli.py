@@ -5,7 +5,13 @@ invocation points SRP_* at tmp_path so nothing touches ./data, ./reports or a de
 
 import csv
 import json
+import os
+import shutil
+import subprocess
+import sys
+from datetime import UTC, datetime
 from pathlib import Path
+from typing import NamedTuple
 
 import pytest
 import sqlalchemy as sa
@@ -13,17 +19,20 @@ from typer.testing import CliRunner
 
 from supplier_reliability.cli import app
 from supplier_reliability.config import Settings, load_app_config
-from supplier_reliability.database import make_engine
-from supplier_reliability.domain.enums import IssueType
-from supplier_reliability.models import DatasetManifest, Supplier, SupplierScore
+from supplier_reliability.database import make_engine, make_session_factory, session_scope
+from supplier_reliability.domain.enums import IssueType, JobStatus
+from supplier_reliability.models import DatasetJob, DatasetManifest, Supplier, SupplierScore
 from supplier_reliability.services import pipeline
+from supplier_reliability.services.generator.config import GeneratorConfig
 from supplier_reliability.services.pipeline import (
     PipelineStageError,
     remove_output_dir,
     run_pipeline,
 )
+from supplier_reliability.services.scoring.evidence import quarter_windows, scorecard_windows
 
-CONFIG_PATH = Path(__file__).resolve().parents[2] / "config" / "default.yaml"
+REPO_ROOT = Path(__file__).resolve().parents[2]
+CONFIG_PATH = REPO_ROOT / "config" / "default.yaml"
 SEED = 20261022
 REPORT_NAMES = {
     "entity_counts",
@@ -71,9 +80,16 @@ def _json(output: str) -> dict:
     return json.loads(output)
 
 
+class Starter(NamedTuple):
+    root: Path  # shared by the module; tests that only read it may use it directly
+    printed: dict
+    manifest: dict
+    snapshot: Path  # untouched copy of root taken right after the run
+
+
 @pytest.fixture(scope="module")
-def starter(tmp_path_factory) -> tuple[Path, dict, dict]:
-    """(root, printed summary, manifest file) of one `srp generate --preset starter` run."""
+def starter(tmp_path_factory) -> Starter:
+    """One `srp generate --preset starter` run (root, printed summary, manifest, snapshot)."""
     root = tmp_path_factory.mktemp("pipeline")
     result = _invoke(root, "generate", "--preset", "starter", "--seed", str(SEED))
     assert result.exit_code == 0, result.output
@@ -81,11 +97,42 @@ def starter(tmp_path_factory) -> tuple[Path, dict, dict]:
     manifest_files = list((root / "data" / "manifests").glob("*.json"))
     assert len(manifest_files) == 1
     manifest = json.loads(manifest_files[0].read_text(encoding="utf-8"))
-    return root, printed, manifest
+    snapshot = tmp_path_factory.mktemp("pipeline-snapshot") / "root"
+    shutil.copytree(root, snapshot)
+    return Starter(root, printed, manifest, snapshot)
+
+
+def _fresh(starter: Starter, tmp_path: Path) -> Path:
+    """A private copy of the freshly generated starter root (DB + data + reports)."""
+    root = tmp_path / "root"
+    shutil.copytree(starter.snapshot, root)
+    return root
+
+
+def _count(root: Path, model) -> int:
+    engine = make_engine(_env(root)["SRP_DATABASE_URL"])
+    try:
+        with engine.connect() as conn:
+            return conn.scalar(sa.select(sa.func.count()).select_from(model))
+    finally:
+        engine.dispose()
+
+
+def _link_dir(link: Path, target: Path) -> None:
+    """Directory symlink, or a Windows junction when symlinks need a privilege."""
+    try:
+        link.symlink_to(target, target_is_directory=True)
+        return
+    except OSError:
+        if sys.platform != "win32":
+            raise
+    import _winapi
+
+    _winapi.CreateJunction(str(target), str(link))
 
 
 def test_cli_generate_starter_end_to_end(starter):
-    root, printed, manifest = starter
+    root, printed, manifest = starter.root, starter.printed, starter.manifest
     counts = printed["counts"]
     assert (counts["suppliers"], counts["purchase_orders"], counts["shipments"]) == (50, 300, 450)
     assert counts["inspections"] == 600
@@ -140,7 +187,7 @@ def test_cli_generate_starter_end_to_end(starter):
 
 
 def test_cli_generate_refuses_without_replace(starter):
-    root, _, manifest = starter
+    root, manifest = starter.root, starter.manifest
     result = _invoke(root, "generate", "--preset", "starter", "--seed", str(SEED))
     assert result.exit_code == 2
     assert "dataset already loaded; pass --replace" in result.output
@@ -150,9 +197,24 @@ def test_cli_generate_refuses_without_replace(starter):
 
 
 def test_cli_generate_replace_reproduces_checksums(starter):
-    root, _, manifest = starter
+    root, manifest = starter.root, starter.manifest
     stale = root / "reports" / "starter" / "stale.json"
     stale.write_text("{}", encoding="utf-8")
+    other_manifest = root / "data" / "manifests" / "DS-full-1-deadbeef.json"
+    other_manifest.write_text('{"preset": "full"}\n', encoding="utf-8")
+    engine = make_engine(_env(root)["SRP_DATABASE_URL"])
+    with session_scope(make_session_factory(engine)) as s:
+        s.add(
+            DatasetJob(
+                job_id="JOB-000001",
+                status=JobStatus.RUNNING,
+                preset="starter",
+                seed=SEED,
+                requested_at=datetime(2026, 10, 29, tzinfo=UTC),
+            )
+        )
+    engine.dispose()
+
     result = _invoke(root, "generate", "--preset", "starter", "--seed", str(SEED), "--replace")
     assert result.exit_code == 0, result.output
     again = json.loads(
@@ -161,36 +223,130 @@ def test_cli_generate_replace_reproduces_checksums(starter):
     assert again["content_checksum"] == manifest["content_checksum"]
     assert again["files"] == manifest["files"]
     assert not stale.exists()  # the preset's report directory was cleared
-    engine = make_engine(_env(root)["SRP_DATABASE_URL"])
-    with engine.connect() as conn:
-        assert conn.scalar(sa.select(sa.func.count()).select_from(Supplier)) == 50
-        assert conn.scalar(sa.select(sa.func.count()).select_from(DatasetManifest)) == 1
-    engine.dispose()
+    assert _count(root, Supplier) == 50
+    assert _count(root, DatasetManifest) == 1
+    # R47: job history and other datasets' manifest files survive a replace
+    assert _count(root, DatasetJob) == 1
+    assert other_manifest.read_text(encoding="utf-8") == '{"preset": "full"}\n'
 
 
-def test_cli_score_idempotent(starter):
-    root, _, _ = starter
-    args = ("score", "--start", "2025-04-01T00:00:00Z", "--end", "2025-06-30T23:59:59Z")
+def test_replace_checks_output_dirs_before_emptying_the_database(starter, tmp_path):
+    root = _fresh(starter, tmp_path)
+    export = root / "data" / "generated" / "starter"
+    shutil.rmtree(export)
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (outside / "keep.csv").write_text("x\n", encoding="utf-8")
+    _link_dir(export, outside)  # data/generated/starter now resolves outside data_dir
+
+    result = _invoke(root, "generate", "--preset", "starter", "--replace")
+    assert result.exit_code == 1
+    assert "replace_guard" in result.output
+    assert "outside" in result.output
+    assert "Traceback" not in result.output
+    assert _count(root, Supplier) == 50  # nothing deleted
+    assert _count(root, DatasetManifest) == 1
+    assert (outside / "keep.csv").is_file()
+    assert (root / "reports" / "starter" / "summary.json").is_file()
+    assert (root / "data" / "ground_truth" / "starter" / "anomaly_ground_truth.csv").is_file()
+
+
+def _non_scorecard_quarter():
+    """A calendar quarter of the reference period that is not one of the scorecard windows."""
+    app_config = load_app_config(CONFIG_PATH)
+    cfg = GeneratorConfig.from_app_config(app_config, "starter")
+    windows = scorecard_windows(
+        cfg.reference_start, cfg.reference_end, app_config.scoring.window_months
+    )
+    taken = {(w.start, w.end, w.cutoff) for w in windows}
+    quarters = quarter_windows(cfg.reference_start, cfg.reference_end)
+    return next(w for w in quarters if (w.start, w.end, w.cutoff) not in taken)
+
+
+def test_cli_score_idempotent(starter, tmp_path):
+    root = _fresh(starter, tmp_path)
+    window = _non_scorecard_quarter()
+    n_suppliers = load_app_config(CONFIG_PATH).generator.presets["starter"]["suppliers"]
+    args = ("score", "--start", window.start.isoformat(), "--end", window.end.isoformat())
     first = _invoke(root, *args)
     assert first.exit_code == 0, first.output
-    assert _json(first.stdout)["created"] == 50
+    assert _json(first.stdout)["created"] == n_suppliers
+    before = _count(root, SupplierScore)
     second = _invoke(root, *args)
     assert second.exit_code == 0, second.output
     out = _json(second.stdout)
     assert out["created"] == 0
-    assert out["existing"] == 50
-    engine = make_engine(_env(root)["SRP_DATABASE_URL"])
-    with engine.connect() as conn:
-        ids = conn.scalars(
-            sa.select(SupplierScore.score_id).where(SupplierScore.score_id.in_(out["score_ids"]))
-        ).all()
-    engine.dispose()
-    assert sorted(ids) == sorted(_json(first.stdout)["score_ids"])
+    assert out["existing"] == n_suppliers
+    assert out["score_ids"] == _json(first.stdout)["score_ids"]
+    assert _count(root, SupplierScore) == before  # the second call wrote nothing
+
+
+def _last_scorecard_args() -> list[str]:
+    app_config = load_app_config(CONFIG_PATH)
+    cfg = GeneratorConfig.from_app_config(app_config, "starter")
+    w = scorecard_windows(cfg.reference_start, cfg.reference_end, app_config.scoring.window_months)[
+        -1
+    ]
+    return ["--start", w.start.isoformat(), "--end", w.end.isoformat()]
+
+
+@pytest.mark.parametrize(
+    ("args", "check"),
+    [
+        (["init-db"], lambda out: out["status"] == "migrated"),
+        (
+            ["recalculate", *_last_scorecard_args(), "--reason", "smoke"],
+            lambda out: out["created"] == 0 and out["unchanged"] + out["existing"] == 50,
+        ),
+        (["validate"], lambda out: out["run_id"] == "VAL-000002" and out["defects"] == 0),
+        (["detect"], lambda out: out["new_exceptions"] == 0),
+        (
+            ["evaluate"],
+            lambda out: out["micro"]["tp"] == 25 and out["reconciliation"]["matched"] == 300,
+        ),
+        (["report"], lambda out: len(out["reports"]) == 14),
+    ],
+    ids=["init-db", "recalculate", "validate", "detect", "evaluate", "report"],
+)
+def test_cli_commands_smoke(starter, tmp_path, args, check):
+    root = _fresh(starter, tmp_path)
+    result = _invoke(root, *args)
+    assert result.exit_code == 0, result.output
+    assert check(_json(result.stdout)), result.stdout
+
+
+def test_detect_uses_the_injected_batch_id(starter, tmp_path):
+    from supplier_reliability.services.anomalies import batch_id_for
+
+    root = _fresh(starter, tmp_path)
+    result = _invoke(root, "detect")
+    assert result.exit_code == 0, result.output
+    assert _json(result.stdout)["batch_id"] == batch_id_for(starter.manifest["dataset_id"])
+
+
+@pytest.mark.parametrize(
+    ("script", "args", "code", "expected"),
+    [
+        ("validate_data.py", [], 0, '"run_id": "VAL-000002"'),
+        ("generate_data.py", ["--preset", "starter"], 2, "dataset already loaded; pass --replace"),
+    ],
+)
+def test_scripts_wrap_the_cli(starter, tmp_path, script, args, code, expected):
+    root = _fresh(starter, tmp_path)
+    done = subprocess.run(
+        [sys.executable, str(REPO_ROOT / "scripts" / script), *args],
+        env=os.environ | _env(root),
+        capture_output=True,
+        text=True,
+        timeout=300,
+        check=False,
+    )
+    assert done.returncode == code, done.stderr
+    assert expected in done.stdout + done.stderr
 
 
 def test_cli_score_rejects_naive_timestamp(starter):
-    root, _, _ = starter
-    result = _invoke(root, "score", "--start", "2025-04-01T00:00:00", "--end", "2025-06-30")
+    result = _invoke(starter.root, "score", "--start", "2025-04-01T00:00:00", "--end", "2025-06-30")
     assert result.exit_code == 1
     assert "UTC offset" in result.output
     assert "Traceback" not in result.output
@@ -229,11 +385,13 @@ def test_run_pipeline_reports_progress_and_stage_on_failure(tmp_path, monkeypatc
     assert stages == ["configure", "migrate", "replace_guard", "generate"]
 
 
-def test_run_pipeline_rejects_unknown_preset_before_touching_anything(tmp_path):
+@pytest.mark.parametrize("preset", ["huge", "../x", "starter/../full", "a\\b", "../../reports"])
+def test_run_pipeline_rejects_unknown_preset_before_touching_anything(tmp_path, preset):
     with pytest.raises(PipelineStageError) as info:
-        run_pipeline(_settings(tmp_path), load_app_config(CONFIG_PATH), "huge", SEED, False)
+        run_pipeline(_settings(tmp_path), load_app_config(CONFIG_PATH), preset, SEED, True)
+    assert info.value.stage == "configure"
     assert "unknown preset" in str(info.value)
-    assert not (tmp_path / "srp.db").exists()
+    assert sorted(p.name for p in tmp_path.iterdir()) == []  # no DB, data or reports dirs
 
 
 def test_remove_output_dir_refuses_paths_outside_base(tmp_path):

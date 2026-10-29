@@ -319,13 +319,18 @@ def _scores(
 # --- public API -------------------------------------------------------------------------------
 
 
+def batch_id_for(dataset_id: str) -> str:
+    """The raw batch id the injector writes for dataset `dataset_id` (D9)."""
+    return f"BATCH-{dataset_id}"
+
+
 def inject_anomalies(
     session: Session, cfg: GeneratorConfig, rs: RandomSource, *, scoring: ScoringConfig
 ) -> InjectionResult:
     """Write the raw batch (negatives + positives A-E, D9) in the caller's transaction and
     return its ground truth. `scoring` is the ScoringConfig used to build score payloads; the
     scorecard windows must already be scored with it (ValueError otherwise)."""
-    batch_id = f"BATCH-{cfg.dataset_id}"
+    batch_id = batch_id_for(cfg.dataset_id)
     existing = session.scalar(
         sa.select(sa.func.count())
         .select_from(RawIngestionRecord)

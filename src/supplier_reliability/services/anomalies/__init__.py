@@ -7,6 +7,7 @@ from supplier_reliability.services.anomalies.injector import (
     INJECTION_VERSION,
     GroundTruthCase,
     InjectionResult,
+    batch_id_for,
     inject_anomalies,
     write_ground_truth,
 )
@@ -15,6 +16,7 @@ __all__ = [
     "INJECTION_VERSION",
     "GroundTruthCase",
     "InjectionResult",
+    "batch_id_for",
     "inject_anomalies",
     "write_ground_truth",
 ]

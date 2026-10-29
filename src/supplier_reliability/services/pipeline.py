@@ -16,7 +16,8 @@ Replace guard: if the database already holds data and ``replace_existing`` is Fa
 ``DatasetAlreadyLoadedError`` is raised. With ``replace_existing`` every table except
 ``dataset_jobs`` (operational job history, which the API job that started this run is itself
 recorded in) is emptied in reverse FK order in ONE transaction, and the preset's output
-directories are removed (only inside ``data_dir`` / ``reports_dir``).
+directories are removed. The directories are resolved and checked (strictly inside ``data_dir`` /
+``reports_dir``) BEFORE any row is deleted, so a refused path leaves the database untouched.
 
 Transactions: each stage commits on success; the pipeline as a whole is NOT one transaction.
 A failing stage raises ``PipelineStageError(stage, cause)`` and leaves the database as the
@@ -48,7 +49,11 @@ from supplier_reliability.database import (
 )
 from supplier_reliability.domain.numeric import ensure_utc
 from supplier_reliability.models import Base, DatasetManifest
-from supplier_reliability.services.anomalies import inject_anomalies, write_ground_truth
+from supplier_reliability.services.anomalies import (
+    batch_id_for,
+    inject_anomalies,
+    write_ground_truth,
+)
 from supplier_reliability.services.anomalies.injector import GROUND_TRUTH_FILE
 from supplier_reliability.services.anomaly_detection import detect_raw_batch
 from supplier_reliability.services.evaluation import (
@@ -97,6 +102,7 @@ __all__ = [
     "OutputPaths",
     "PipelineResult",
     "PipelineStageError",
+    "check_removable",
     "current_manifest",
     "git_sha",
     "output_paths",
@@ -168,11 +174,18 @@ def output_paths(settings: Settings, preset: str) -> OutputPaths:
     )
 
 
-def remove_output_dir(path: Path, base: Path) -> None:
-    """Delete directory `path` (if present) only when it resolves strictly inside `base`."""
+def check_removable(path: Path, base: Path) -> Path:
+    """`path` resolved (symlinks and junctions followed); ValueError unless it lies strictly
+    inside `base` (also resolved)."""
     resolved, root = Path(path).resolve(), Path(base).resolve()
     if resolved == root or not resolved.is_relative_to(root):
         raise ValueError(f"refusing to remove {path}: outside {base}")
+    return resolved
+
+
+def remove_output_dir(path: Path, base: Path) -> None:
+    """Delete directory `path` (if present) only when it resolves strictly inside `base`."""
+    resolved = check_removable(path, base)
     if resolved.exists():
         shutil.rmtree(resolved)
 
@@ -305,6 +318,7 @@ def run_pipeline(
         )
         scored_at = windows[-1].cutoff + timedelta(days=1)
         detected_at = ensure_utc(cfg.reference_end) + timedelta(days=2)
+        batch_id = batch_id_for(cfg.dataset_id)
 
     with _stage("migrate", on_progress):
         _ensure_sqlite_dir(settings.database_url)
@@ -313,15 +327,24 @@ def run_pipeline(
     factory = make_session_factory(engine)
     try:
         with _stage("replace_guard", on_progress):
+            # every output directory is checked BEFORE any row is deleted
+            removable = (
+                [
+                    check_removable(paths.export_dir, settings.data_dir),
+                    check_removable(paths.ground_truth_dir, settings.data_dir),
+                    check_removable(paths.reports_dir, settings.reports_dir),
+                ]
+                if replace_existing
+                else []
+            )
             with session_scope(factory) as s:
                 if _has_data(s):
                     if not replace_existing:
                         raise DatasetAlreadyLoadedError("dataset already loaded; pass --replace")
                     _delete_all(s)
-            if replace_existing:
-                remove_output_dir(paths.export_dir, settings.data_dir)
-                remove_output_dir(paths.ground_truth_dir, settings.data_dir)
-                remove_output_dir(paths.reports_dir, settings.reports_dir)
+            for directory in removable:
+                if directory.exists():
+                    shutil.rmtree(directory)
 
         with _stage("generate", on_progress):
             ds = generate_dataset(cfg)
@@ -337,7 +360,7 @@ def run_pipeline(
 
         with _stage("detect", on_progress), factory() as s:
             service = ScoringService(s, app_config.scoring, lambda: detected_at)
-            detect_raw_batch(s, injected.batch_id, service, lambda: detected_at)
+            detect_raw_batch(s, batch_id, service, lambda: detected_at)
 
         with _stage("validate", on_progress), factory() as s:
             validation = run_validation(s, clock=lambda: detected_at)
@@ -353,7 +376,7 @@ def run_pipeline(
             ground_truth_path = paths.ground_truth_dir / GROUND_TRUTH_FILE
 
         with _stage("evaluate", on_progress), factory() as s:
-            evaluation = evaluate_anomalies(s, injected.batch_id, ground_truth_path)
+            evaluation = evaluate_anomalies(s, batch_id, ground_truth_path)
             rec = reconcile_scores(s, paths.export_dir, windows, tolerance=Decimal(0))
 
         with _stage("reports", on_progress), factory() as s:
@@ -362,7 +385,7 @@ def run_pipeline(
                 app_config,
                 paths.reports_dir,
                 validation_run_id=run_id,
-                batch_id=injected.batch_id,
+                batch_id=batch_id,
                 ground_truth_path=ground_truth_path,
                 export_dir=paths.export_dir,
                 windows=windows,
@@ -388,7 +411,7 @@ def run_pipeline(
         counts=counts,
         manifest_path=manifest_path,
         validation_run_id=run_id,
-        batch_id=injected.batch_id,
+        batch_id=batch_id,
         evaluation=evaluation,
         report_paths=report_paths,
         validation=validation_counts(validation.counts_by_severity),

@@ -20,6 +20,7 @@ from sqlalchemy.orm import Session
 from supplier_reliability.config import AppConfig, Settings, load_app_config
 from supplier_reliability.database import make_engine, make_session_factory, run_migrations
 from supplier_reliability.models import ValidationRun
+from supplier_reliability.services.anomalies import batch_id_for
 from supplier_reliability.services.anomalies.injector import GROUND_TRUTH_FILE
 from supplier_reliability.services.anomaly_detection import detect_raw_batch
 from supplier_reliability.services.evaluation import (
@@ -279,7 +280,7 @@ def detect(batch_id: BatchOpt = None) -> None:
     with _guard():
         settings = Settings()
         with _session(settings) as s:
-            batch = batch_id or f"BATCH-{current_manifest(s)['dataset_id']}"
+            batch = batch_id or batch_id_for(current_manifest(s)["dataset_id"])
             service = ScoringService(s, _config(settings).scoring, _utcnow)
             result = detect_raw_batch(s, batch, service, _utcnow)
         _emit(
@@ -313,7 +314,7 @@ def _context(
     paths = output_paths(settings, manifest["preset"])
     return (
         manifest["preset"],
-        batch_id or f"BATCH-{manifest['dataset_id']}",
+        batch_id or batch_id_for(manifest["dataset_id"]),
         ground_truth or paths.ground_truth_dir / GROUND_TRUTH_FILE,
         export_dir or paths.export_dir,
     )
