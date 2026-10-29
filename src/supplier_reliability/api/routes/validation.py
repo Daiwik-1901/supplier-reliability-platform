@@ -7,8 +7,13 @@ from typing import Annotated
 
 from fastapi import APIRouter, Body, Query
 
-from supplier_reliability.api.dependencies import DbDep, PageParams
-from supplier_reliability.api.errors import InvalidRequestError, NotFoundError, error_responses
+from supplier_reliability.api.dependencies import DbDep, PageParams, wall_clock
+from supplier_reliability.api.errors import (
+    InvalidRequestError,
+    NotFoundError,
+    bounded_list,
+    error_responses,
+)
 from supplier_reliability.domain.enums import Severity
 from supplier_reliability.repositories import validation as repo
 from supplier_reliability.schemas.common import IdStr, Page
@@ -22,8 +27,6 @@ from supplier_reliability.services.reporting.quality_reports import DEFECT_SEVER
 from supplier_reliability.services.validation import REGISTRY, ValidationRunResult, run_validation
 
 router = APIRouter(prefix="/api/v1/validation", tags=["validation"])
-
-MAX_LISTED_IDS = 10
 
 
 def _summary(result: ValidationRunResult) -> ValidationRunOut:
@@ -74,11 +77,10 @@ def run(
     if rule_ids is not None:
         unknown = sorted(set(rule_ids) - set(REGISTRY))
         if unknown:
-            shown = ", ".join(unknown[:MAX_LISTED_IDS])
-            more = len(unknown) - MAX_LISTED_IDS
-            suffix = f" (and {more} more)" if more > 0 else ""
-            raise InvalidRequestError(["body", "rule_ids"], f"Unknown rule ids: {shown}{suffix}")
-    return _summary(run_validation(db, rule_ids=rule_ids, persist=True))
+            raise InvalidRequestError(
+                ["body", "rule_ids"], f"Unknown rule ids: {bounded_list(unknown)}"
+            )
+    return _summary(run_validation(db, rule_ids=rule_ids, persist=True, clock=wall_clock))
 
 
 @router.get(

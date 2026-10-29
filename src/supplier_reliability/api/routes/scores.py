@@ -3,14 +3,23 @@
 The scoring service owns its transaction (it commits per call and refuses a session with pending
 changes), so these handlers only read before calling it and never commit afterwards.
 Scores calculated through the API stamp `calculated_at` with the wall clock (UTC); the pipeline
-uses deterministic clocks instead."""
+uses deterministic clocks instead.
 
-from collections.abc import Sequence
-from datetime import UTC, datetime
+Concurrent submissions (Ruling R50): the score-writing routes (calculate, recalculate, restate)
+hold one process-wide lock around the service call, so a double-submit is serialised and the
+second request finds the first one's rows (`existing`/`unchanged`). A unique-constraint
+IntegrityError from score insertion is retried once (the service rolled back; the retry sees the
+competing commit). Limitation: this is a single-process guarantee. Several workers or instances
+need database-level locking or sequences for score ids (PostgreSQL: UNVERIFIED, not available
+on the build machine); a second IntegrityError surfaces as a 500."""
+
+import threading
+from collections.abc import Callable
 from typing import Annotated
 
 from fastapi import APIRouter, Depends, Query, Response
 from pydantic import AwareDatetime
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from supplier_reliability.api.dependencies import (
@@ -20,8 +29,14 @@ from supplier_reliability.api.dependencies import (
     PageParams,
     Sort,
     sort_dependency,
+    wall_clock,
 )
-from supplier_reliability.api.errors import ConflictError, NotFoundError, error_responses
+from supplier_reliability.api.errors import (
+    ConflictError,
+    NotFoundError,
+    bounded_list,
+    error_responses,
+)
 from supplier_reliability.config import AppConfig
 from supplier_reliability.domain.enums import CalculationStatus, ReliabilityCategory
 from supplier_reliability.repositories import scores as repo
@@ -40,6 +55,7 @@ from supplier_reliability.services.scoring.evidence import EvaluationWindow
 from supplier_reliability.services.scoring.service import (
     CalculationOutcome,
     CalculationRequest,
+    NothingToRestateError,
     ScoringService,
 )
 
@@ -48,17 +64,22 @@ router = APIRouter(prefix="/api/v1/scores", tags=["scores"])
 SCORE_SORT_FIELDS = ("overall_score", "evaluation_end", "supplier_id", "score_id")
 ScoreSort = Annotated[Sort, Depends(sort_dependency(SCORE_SORT_FIELDS, default="score_id:asc"))]
 AWARE_NOTE = "ISO-8601 with a UTC offset (for example `Z`); a naive datetime is a 422."
-MAX_LISTED_IDS = 10
+SERIALISATION_NOTE = (
+    " Writes are serialised per server process (a concurrent duplicate request returns the "
+    "first one's result); this does not hold across several workers or instances."
+)
+
+_WRITE_LOCK = threading.Lock()
 
 
-def _wall_clock() -> datetime:
-    return datetime.now(UTC)
-
-
-def _bounded(ids: Sequence[str]) -> str:
-    shown = ", ".join(ids[:MAX_LISTED_IDS])
-    extra = len(ids) - MAX_LISTED_IDS
-    return shown if extra <= 0 else f"{shown} (and {extra} more)"
+def _serialised[T](call: Callable[[], T]) -> T:
+    """Run a score-writing service call under the process-wide lock; retry once on IntegrityError
+    (the service has rolled back, so the retry sees whatever a competing writer committed)."""
+    with _WRITE_LOCK:
+        try:
+            return call()
+        except IntegrityError:
+            return call()
 
 
 def _unique_known_suppliers(db: Session, supplier_ids: list[str] | None) -> list[str] | None:
@@ -68,7 +89,7 @@ def _unique_known_suppliers(db: Session, supplier_ids: list[str] | None) -> list
     unique = sorted(set(supplier_ids))
     unknown = sorted(set(unique) - existing_supplier_ids(db, unique))
     if unknown:
-        raise NotFoundError("Suppliers", _bounded(unknown))
+        raise NotFoundError("Suppliers", bounded_list(unknown))
     return unique
 
 
@@ -82,7 +103,7 @@ def _outcome(result: CalculationOutcome) -> CalculationOutcomeOut:
 
 
 def _service(db: Session, config: AppConfig) -> ScoringService:
-    return ScoringService(db, config.scoring, _wall_clock)
+    return ScoringService(db, config.scoring, wall_clock)
 
 
 def _require_version(config: AppConfig, requested: str | None) -> None:
@@ -144,7 +165,7 @@ def list_scores(
     description="Scores the window for the given suppliers (default all). Idempotent: an "
     "already scored window/cutoff/version is returned under `existing`. 201 when any score was "
     "created, otherwise 200. `calculated_at` is the server's wall-clock UTC time. A "
-    "`scoring_version` other than the configured one is a 409.",
+    "`scoring_version` other than the configured one is a 409." + SERIALISATION_NOTE,
     responses={201: {"model": CalculationOutcomeOut, "description": "Scores were created"}}
     | error_responses(404, 409, 422),
 )
@@ -153,7 +174,8 @@ def calculate(
 ) -> CalculationOutcomeOut:
     _require_version(config, body.scoring_version)
     ids = _unique_known_suppliers(db, body.supplier_ids)
-    result = _service(db, config).calculate(_request(body, ids))
+    service, req = _service(db, config), _request(body, ids)
+    result = _serialised(lambda: service.calculate(req))
     response.status_code = 201 if result.created else 200
     return _outcome(result)
 
@@ -165,13 +187,15 @@ def calculate(
     description="Recomputes the window against the evidence known at its cutoff. Unchanged "
     "evidence writes nothing (`unchanged`); changed evidence supersedes the current score with "
     "a new version (`superseded`: old id to new id) and the old version stays readable. "
-    "Always 200. `reason` (1-500 characters) is stored as the version's change reason.",
+    "Always 200. `reason` (1-500 characters) is stored as the version's change reason."
+    + SERIALISATION_NOTE,
     responses=error_responses(404, 409, 422),
 )
 def recalculate(body: RecalculateRequest, db: DbDep, config: AppConfigDep) -> CalculationOutcomeOut:
     _require_version(config, body.scoring_version)
     ids = _unique_known_suppliers(db, body.supplier_ids)
-    return _outcome(_service(db, config).recalculate(_request(body, ids), body.reason))
+    service, req = _service(db, config), _request(body, ids)
+    return _outcome(_serialised(lambda: service.recalculate(req, body.reason)))
 
 
 @router.post(
@@ -182,16 +206,21 @@ def recalculate(body: RecalculateRequest, db: DbDep, config: AppConfigDep) -> Ca
     description="Scores the same window with a later `data_cutoff` as a new evaluation that "
     "links to the earlier score (`restates_score_id`) and records the differences. The cutoff "
     "must be later than an existing score's cutoff for that window and supplier; otherwise "
-    "409. Repeating the request returns the stored restatement under `existing`.",
+    "409. Repeating the request also returns 201, with `created` empty and the stored "
+    "restatement under `existing`." + SERIALISATION_NOTE,
     responses=error_responses(404, 409, 422),
 )
 def restate(body: RestateRequest, db: DbDep, config: AppConfigDep) -> CalculationOutcomeOut:
     ids = _unique_known_suppliers(db, body.supplier_ids)
     window = EvaluationWindow(body.evaluation_start, body.evaluation_end, body.data_cutoff)
+    service = _service(db, config)
     try:
-        return _outcome(_service(db, config).restate(window, ids, body.reason))
-    except ValueError as exc:  # "no earlier score ... to restate"
-        raise ConflictError(str(exc)) from exc
+        return _outcome(_serialised(lambda: service.restate(window, ids, body.reason)))
+    except NothingToRestateError as exc:  # any other ValueError is a fault: 500
+        raise ConflictError(
+            f"no earlier score with a cutoff before {exc.cutoff} to restate for "
+            f"{bounded_list(exc.missing) or 'any supplier'}"
+        ) from exc
 
 
 @router.get(

@@ -14,8 +14,10 @@ RuleId = Annotated[str, StringConstraints(pattern=r"^[A-Za-z0-9_-]{1,32}$", max_
 class ValidationRunRequest(BaseModel):
     rule_ids: list[RuleId] | None = Field(
         default=None,
+        min_length=1,
         max_length=MAX_RULE_IDS,
-        description="Rules to run (duplicates ignored); omit for every registered rule.",
+        description="Rules to run (duplicates ignored); omit the field, or send no body, "
+        "for every registered rule.",
     )
 
     model_config = ConfigDict(

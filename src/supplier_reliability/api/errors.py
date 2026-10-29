@@ -4,6 +4,7 @@ Codes: not_found 404, conflict 409, validation_error 422, payload_too_large 413,
 internal_error 500 (generic message; the exception is logged server-side only)."""
 
 import logging
+from collections.abc import Sequence
 from typing import Any
 
 from fastapi import FastAPI, Request
@@ -23,6 +24,16 @@ _CODES = {
     413: "payload_too_large",
     422: "validation_error",
 }
+
+
+MAX_LISTED_IDS = 10
+
+
+def bounded_list(items: Sequence[str], limit: int = MAX_LISTED_IDS) -> str:
+    """At most `limit` items comma-joined, then "(and N more)": keeps messages bounded."""
+    shown = ", ".join(items[:limit])
+    extra = len(items) - limit
+    return shown if extra <= 0 else f"{shown} (and {extra} more)"
 
 
 class NotFoundError(Exception):

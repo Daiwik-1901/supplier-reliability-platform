@@ -4,10 +4,13 @@ Expected values come from independent SQL against the same database copy, never 
 under test. Every test has its own database copy (tests/api/conftest.py)."""
 
 import hashlib
+import threading
 from datetime import UTC, datetime, timedelta
 
 import pytest
 import sqlalchemy as sa
+from fastapi.testclient import TestClient
+from sqlalchemy.exc import IntegrityError
 
 from supplier_reliability.domain.enums import (
     DeliveryEventType,
@@ -26,6 +29,13 @@ from supplier_reliability.models import (
     ValidationFinding,
     ValidationRun,
 )
+from supplier_reliability.schemas.scores import (
+    CalculateRequest,
+    RecalculateRequest,
+    RestateRequest,
+)
+from supplier_reliability.schemas.validation import ValidationRunRequest
+from supplier_reliability.services.scoring.service import ScoringService
 from supplier_reliability.services.validation import REGISTRY
 
 SCORES = "/api/v1/scores"
@@ -43,6 +53,11 @@ def session(client):
 def supplier_ids(client, n):
     with session(client) as s:
         return list(s.scalars(sa.select(Supplier.supplier_id).order_by(Supplier.supplier_id)))[:n]
+
+
+def count_scores(client) -> int:
+    with session(client) as s:
+        return s.scalar(sa.select(sa.func.count()).select_from(SupplierScore))
 
 
 def last_score(client):
@@ -185,14 +200,15 @@ def test_calculate_defaults_cutoff_to_window_end(api_client):
     ],
 )
 def test_calculate_invalid_period_422(api_client, patch):
+    before = count_scores(api_client)
     r = api_client.post(f"{SCORES}/calculate", json={**NEW_WINDOW, **patch})
     assert r.status_code == 422
     assert r.json()["error"]["code"] == "validation_error"
-    with session(api_client) as s:  # nothing written
-        assert s.scalar(sa.select(sa.func.count()).select_from(SupplierScore)) == 300
+    assert count_scores(api_client) == before  # nothing written
 
 
 def test_calculate_unknown_supplier_404(api_client):
+    before = count_scores(api_client)
     real = supplier_ids(api_client, 1)[0]
     r = api_client.post(
         f"{SCORES}/calculate",
@@ -203,8 +219,7 @@ def test_calculate_unknown_supplier_404(api_client):
     assert err["code"] == "not_found"
     assert "SUP-999998" in err["message"] and "SUP-999999" in err["message"]
     assert real not in err["message"]
-    with session(api_client) as s:
-        assert s.scalar(sa.select(sa.func.count()).select_from(SupplierScore)) == 300
+    assert count_scores(api_client) == before
 
 
 def test_unknown_supplier_listing_is_bounded(api_client):
@@ -268,7 +283,8 @@ def test_recalculate_preserves_history(api_client):
                 SupplierScore.is_current.is_(True),
             )
         ).one()
-        old_id, old_overall = old.score_id, old.overall_score
+        old_id = old.score_id
+        old_state = {c.key: getattr(old, c.key) for c in sa.inspect(SupplierScore).columns}
     body = window_body(
         score,
         data_cutoff=iso(score.data_cutoff_timestamp),
@@ -287,8 +303,11 @@ def test_recalculate_preserves_history(api_client):
     assert by_id[old_id]["version_number"] == 1
     assert by_id[new_id]["is_current"] is True and by_id[new_id]["version_number"] == 2
     assert by_id[new_id]["change_reason"] == "late ARRIVED loaded"
-    with session(api_client) as s:  # old version untouched
-        assert s.get(SupplierScore, old_id).overall_score == old_overall
+    with session(api_client) as s:  # never overwritten: only the two supersession flags change
+        stored = s.get(SupplierScore, old_id)
+        for key, value in old_state.items():
+            if key not in ("is_current", "superseded_by_score_id"):
+                assert getattr(stored, key) == value, key
     # a repeat finds nothing more to change
     again = api_client.post(f"{SCORES}/recalculate", json=body).json()
     assert again["superseded"] == {} and again["unchanged"] == [new_id]
@@ -317,6 +336,7 @@ def test_restate_links_to_the_earlier_score(api_client):
 
 
 def test_restate_without_an_earlier_score_is_409(api_client):
+    before = count_scores(api_client)
     sid = supplier_ids(api_client, 1)[0]
     body = {
         **NEW_WINDOW,
@@ -326,8 +346,7 @@ def test_restate_without_an_earlier_score_is_409(api_client):
     }
     r = api_client.post(f"{SCORES}/restate", json=body)
     assert r.status_code == 409 and r.json()["error"]["code"] == "conflict"
-    with session(api_client) as s:
-        assert s.scalar(sa.select(sa.func.count()).select_from(SupplierScore)) == 300
+    assert count_scores(api_client) == before
 
 
 def test_restate_validates_body(api_client):
@@ -577,13 +596,20 @@ NEW_ROUTES = {
 }
 
 
+# POST routes whose only success status is 201 (calculate is 200 or 201 depending on the result).
+CREATED_ONLY = {("/api/v1/scores/restate", "post"), ("/api/v1/validation/run", "post")}
+
+
 def test_new_routes_are_documented(api_client):
     spec = api_client.get("/openapi.json").json()
     for (path, method), statuses in NEW_ROUTES.items():
         op = spec["paths"][path][method]
         assert op.get("summary") and op.get("description"), (path, method)
-        ok = [c for c in ("200", "201") if c in op["responses"]]
-        assert ok and "schema" in op["responses"][ok[0]]["content"]["application/json"]
+        success = "201" if (path, method) in CREATED_ONLY else "200"
+        assert success in op["responses"], (path, method)
+        assert "schema" in op["responses"][success]["content"]["application/json"]
+        if method == "get":
+            assert "201" not in op["responses"], (path, method)
         assert statuses <= set(op["responses"]), (path, method)
         for code in statuses:
             ref = op["responses"][code]["content"]["application/json"]["schema"]["$ref"]
@@ -592,12 +618,20 @@ def test_new_routes_are_documented(api_client):
     assert "200" in spec["paths"]["/api/v1/scores/calculate"]["post"]["responses"]
 
 
-@pytest.mark.parametrize(
-    "model", ["CalculateRequest", "RecalculateRequest", "RestateRequest", "ValidationRunRequest"]
-)
-def test_request_models_carry_valid_examples(api_client, model):
-    schema = api_client.get("/openapi.json").json()["components"]["schemas"][model]
-    assert schema.get("examples")
+REQUEST_MODELS = {
+    "CalculateRequest": CalculateRequest,
+    "RecalculateRequest": RecalculateRequest,
+    "RestateRequest": RestateRequest,
+    "ValidationRunRequest": ValidationRunRequest,
+}
+
+
+@pytest.mark.parametrize("name", REQUEST_MODELS)
+def test_request_examples_are_published_and_validate_against_the_model(api_client, name):
+    schema = api_client.get("/openapi.json").json()["components"]["schemas"][name]
+    assert schema["examples"]
+    for example in schema["examples"]:
+        REQUEST_MODELS[name].model_validate(example)
 
 
 def test_documented_request_examples_are_accepted(api_client):
@@ -613,3 +647,119 @@ def test_documented_request_examples_are_accepted(api_client):
             r = api_client.post(url, json=example)
             # examples are well-formed: never a 422 (they may legitimately be 404/409 here)
             assert r.status_code != 422, (model, r.text)
+
+
+# --- fix round 1 -----------------------------------------------------------------------------
+
+
+def test_restate_missing_ids_are_bounded_in_the_409(api_client):
+    ids = supplier_ids(api_client, 25)
+    body = {
+        **NEW_WINDOW,
+        "data_cutoff": "2025-07-15T00:00:00Z",
+        "supplier_ids": ids,
+        "reason": "nothing to restate",
+    }
+    r = api_client.post(f"{SCORES}/restate", json=body)
+    assert r.status_code == 409
+    message = r.json()["error"]["message"]
+    assert sum(sid in message for sid in ids) == 10
+    assert "and 15 more" in message
+
+
+def test_unrelated_value_error_in_restate_is_500_not_409(api_client, monkeypatch):
+    def broken(self, window, supplier_ids, reason):
+        raise ValueError("score id space SCORE-2026-NNNNNN exhausted")
+
+    monkeypatch.setattr(ScoringService, "restate", broken)
+    client = TestClient(api_client.app, raise_server_exceptions=False)
+    body = {
+        **NEW_WINDOW,
+        "data_cutoff": "2025-07-15T00:00:00Z",
+        "supplier_ids": supplier_ids(api_client, 1),
+        "reason": "r",
+    }
+    r = client.post(f"{SCORES}/restate", json=body)
+    assert r.status_code == 500
+    assert r.json()["error"]["code"] == "internal_error"
+    assert "exhausted" not in r.text
+
+
+def test_concurrent_calculate_of_the_same_window_creates_once(api_client):
+    ids = supplier_ids(api_client, 3)
+    body = {**NEW_WINDOW, "supplier_ids": ids}
+    before = count_scores(api_client)
+    barrier = threading.Barrier(2)
+    results: list = []
+
+    def submit():
+        client = TestClient(api_client.app)
+        barrier.wait()
+        results.append(client.post(f"{SCORES}/calculate", json=body))
+
+    threads = [threading.Thread(target=submit) for _ in range(2)]
+    for th in threads:
+        th.start()
+    for th in threads:
+        th.join()
+    assert sorted(r.status_code for r in results) == [200, 201], [r.text for r in results]
+    created = next(r.json() for r in results if r.status_code == 201)
+    existing = next(r.json() for r in results if r.status_code == 200)
+    assert len(created["created"]) == 3 and existing["created"] == []
+    assert sorted(existing["existing"]) == sorted(created["created"])
+    assert count_scores(api_client) == before + 3
+
+
+def test_calculate_retries_once_after_an_integrity_error(api_client, monkeypatch):
+    """A writer in another process wins the insert race: the API retries once and reports
+    `existing` instead of failing."""
+    ids = supplier_ids(api_client, 2)
+    body = {**NEW_WINDOW, "supplier_ids": ids}
+    real = ScoringService.calculate
+    calls = []
+
+    def racing(self, req):
+        calls.append(1)
+        if len(calls) == 1:
+            with session(api_client) as other:
+                real(ScoringService(other, self.cfg, self.clock), req)  # the competitor commits
+            raise IntegrityError("INSERT supplier_scores", {}, Exception("UNIQUE constraint"))
+        return real(self, req)
+
+    monkeypatch.setattr(ScoringService, "calculate", racing)
+    r = api_client.post(f"{SCORES}/calculate", json=body)
+    assert r.status_code == 200 and len(calls) == 2
+    assert r.json()["created"] == [] and len(r.json()["existing"]) == 2
+
+
+def test_persistent_integrity_error_is_500(api_client, monkeypatch):
+    def always(self, req):
+        raise IntegrityError("INSERT supplier_scores", {}, Exception("UNIQUE constraint"))
+
+    monkeypatch.setattr(ScoringService, "calculate", always)
+    client = TestClient(api_client.app, raise_server_exceptions=False)
+    r = client.post(
+        f"{SCORES}/calculate", json={**NEW_WINDOW, "supplier_ids": supplier_ids(api_client, 1)}
+    )
+    assert r.status_code == 500 and r.json()["error"]["code"] == "internal_error"
+
+
+def test_validation_run_rejects_empty_rule_ids(api_client):
+    r = api_client.post("/api/v1/validation/run", json={"rule_ids": []})
+    assert r.status_code == 422
+    assert r.json()["error"]["details"][0]["loc"] == ["body", "rule_ids"]
+
+
+def test_validation_run_uses_the_wall_clock(api_client):
+    run = api_client.post("/api/v1/validation/run", json={}).json()
+    with session(api_client) as s:
+        stored = s.get(ValidationRun, run["run_id"])
+        assert datetime.now(UTC) - stored.started_at < timedelta(minutes=5)
+        stamps = list(
+            s.scalars(
+                sa.select(ValidationFinding.detection_timestamp).where(
+                    ValidationFinding.run_id == run["run_id"]
+                )
+            )
+        )
+    assert stamps and all(datetime.now(UTC) - ts < timedelta(minutes=5) for ts in stamps)

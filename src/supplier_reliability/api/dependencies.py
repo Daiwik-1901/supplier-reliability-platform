@@ -2,6 +2,7 @@
 
 from collections.abc import Callable, Iterator, Sequence
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from typing import Annotated
 
 from fastapi import Depends, Path, Query, Request
@@ -18,6 +19,12 @@ IdPath = Annotated[
     str,
     Path(pattern=r"^[A-Z0-9-]{1,40}$", max_length=40, examples=["SUP-000001"]),
 ]
+
+
+def wall_clock() -> datetime:
+    """Current UTC time: the clock of API-triggered scoring and validation (the pipeline uses
+    deterministic clocks instead)."""
+    return datetime.now(UTC)
 
 
 def get_settings(request: Request) -> Settings:

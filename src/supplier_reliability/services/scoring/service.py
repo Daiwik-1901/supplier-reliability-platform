@@ -170,6 +170,19 @@ class CalculationOutcome:
     superseded: dict[str, str] = field(default_factory=dict)  # old score_id -> new score_id
 
 
+class NothingToRestateError(ValueError):
+    """`restate` found no earlier score to restate (the only ValueError that is a request
+    conflict rather than a fault). `missing` holds the suppliers without one (empty when there
+    are no suppliers at all); `cutoff` is the requested cutoff as ISO-8601 UTC."""
+
+    def __init__(self, cutoff: str, missing: list[str]) -> None:
+        self.cutoff, self.missing = cutoff, missing
+        super().__init__(
+            f"no earlier score with a cutoff before {cutoff} to restate for "
+            f"{missing or 'any supplier'}"
+        )
+
+
 class CorrectionOutcome(StrEnum):
     """What `stage_corrected` did (stored in the leakage exception's evidence)."""
 
@@ -458,10 +471,7 @@ class ScoringService:
         targets = sorted(restated) if ids is None else ids
         missing = [sid for sid in targets if sid not in restated]
         if not targets or missing:
-            raise ValueError(
-                "no earlier score with a cutoff before "
-                f"{_iso(window.cutoff)} to restate for {missing or 'any supplier'}"
-            )
+            raise NothingToRestateError(_iso(window.cutoff), missing)
         keys = self._keys(targets, window)
         current = self._current(keys.values())
         out.existing.extend(current[keys[sid]].score_id for sid in targets if keys[sid] in current)
